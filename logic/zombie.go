@@ -37,7 +37,7 @@ func CheckZombies(newnode *models.Node) {
 			//skip self
 			continue
 		}
-		if node.HostID == newnode.HostID || time.Now().After(node.ExpirationDateTime) {
+		if node.HostID == newnode.HostID {
 			logger.Log(0, "adding ", node.ID.String(), " to zombie list")
 			newZombie <- node.ID
 		}
@@ -49,7 +49,7 @@ func CheckZombies(newnode *models.Node) {
 func checkForZombieHosts(h *models.Host) {
 	hosts, err := GetAllHosts()
 	if err != nil {
-		logger.Log(3, "errror retrieving all hosts", err.Error())
+		logger.Log(3, "error retrieving all hosts", err.Error())
 	}
 	for _, existing := range hosts {
 		if existing.ID == h.ID {
@@ -76,17 +76,22 @@ func checkForZombieHosts(h *models.Host) {
 // ManageZombies - goroutine which adds/removes/deletes nodes from the zombie node quarantine list
 func ManageZombies(ctx context.Context, peerUpdate chan *models.Node) {
 	logger.Log(2, "Zombie management started")
-	InitializeZombies()
+	go InitializeZombies()
+
+	// Zombie Nodes Cleanup Four Times a Day
+	ticker := time.NewTicker(time.Hour * ZOMBIE_TIMEOUT)
+
 	for {
 		select {
 		case <-ctx.Done():
+			ticker.Stop()
 			close(peerUpdate)
 			return
 		case id := <-newZombie:
 			zombies = append(zombies, id)
 		case id := <-newHostZombie:
 			hostZombies = append(hostZombies, id)
-		case <-time.After(time.Hour * ZOMBIE_TIMEOUT): // run this check 4 times a day
+		case <-ticker.C: // run this check 4 times a day
 			logger.Log(3, "checking for zombie nodes")
 			if len(zombies) > 0 {
 				for i := len(zombies) - 1; i >= 0; i-- {
@@ -97,11 +102,12 @@ func ManageZombies(ctx context.Context, peerUpdate chan *models.Node) {
 						zombies = append(zombies[:i], zombies[i+1:]...)
 						continue
 					}
-					if time.Since(node.LastCheckIn) > time.Minute*ZOMBIE_DELETE_TIME || time.Now().After(node.ExpirationDateTime) {
+					if time.Since(node.LastCheckIn) > time.Minute*ZOMBIE_DELETE_TIME {
 						if err := DeleteNode(&node, true); err != nil {
 							logger.Log(1, "error deleting zombie node", zombies[i].String(), err.Error())
 							continue
 						}
+						node.PendingDelete = true
 						node.Action = models.NODE_DELETE
 						peerUpdate <- &node
 						logger.Log(1, "deleting zombie node", node.ID.String())
@@ -115,14 +121,17 @@ func ManageZombies(ctx context.Context, peerUpdate chan *models.Node) {
 					host, err := GetHost(hostZombies[i].String())
 					if err != nil {
 						logger.Log(1, "error retrieving zombie host", err.Error())
-						logger.Log(1, "deleting ", host.ID.String(), " from zombie list")
-						zombies = append(zombies[:i], zombies[i+1:]...)
+						if host != nil {
+							logger.Log(1, "deleting ", host.ID.String(), " from zombie list")
+						}
+						hostZombies = append(hostZombies[:i], hostZombies[i+1:]...)
 						continue
 					}
 					if len(host.Nodes) == 0 {
-						if err := RemoveHost(host); err != nil {
+						if err := RemoveHost(host, true); err != nil {
 							logger.Log(0, "error deleting zombie host", host.ID.String(), err.Error())
 						}
+						hostZombies = append(hostZombies[:i], hostZombies[i+1:]...)
 					}
 				}
 			}

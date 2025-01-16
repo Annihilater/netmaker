@@ -6,11 +6,14 @@ import (
 	"encoding/base32"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net"
 	"os"
 	"strings"
 	"time"
+	"unicode"
 
+	"github.com/blang/semver"
 	"github.com/c-robinson/iplib"
 	"github.com/gravitl/netmaker/database"
 	"github.com/gravitl/netmaker/logger"
@@ -89,7 +92,7 @@ func StringSliceContains(slice []string, item string) bool {
 	return false
 }
 
-// NormalCIDR - returns the first address of CIDR
+// NormalizeCIDR - returns the first address of CIDR
 func NormalizeCIDR(address string) (string, error) {
 	ip, IPNet, err := net.ParseCIDR(address)
 	if err != nil {
@@ -134,4 +137,42 @@ func RemoveStringSlice(slice []string, i int) []string {
 	return append(slice[:i], slice[i+1:]...)
 }
 
-// == private ==
+// IsSlicesEqual tells whether a and b contain the same elements.
+// A nil argument is equivalent to an empty slice.
+func IsSlicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i, v := range a {
+		if v != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// VersionLessThan checks if v1 < v2 semantically
+// dev is the latest version
+func VersionLessThan(v1, v2 string) (bool, error) {
+	if v1 == "dev" {
+		return false, nil
+	}
+	if v2 == "dev" {
+		return true, nil
+	}
+	semVer1 := strings.TrimFunc(v1, func(r rune) bool {
+		return !unicode.IsNumber(r)
+	})
+	semVer2 := strings.TrimFunc(v2, func(r rune) bool {
+		return !unicode.IsNumber(r)
+	})
+	sv1, err := semver.Parse(semVer1)
+	if err != nil {
+		return false, fmt.Errorf("failed to parse semver1 (%s): %w", semVer1, err)
+	}
+	sv2, err := semver.Parse(semVer2)
+	if err != nil {
+		return false, fmt.Errorf("failed to parse semver2 (%s): %w", semVer2, err)
+	}
+	return sv1.LT(sv2), nil
+}

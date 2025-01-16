@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -16,9 +17,15 @@ import (
 // EmqxBrokerType denotes the broker type for EMQX MQTT
 const EmqxBrokerType = "emqx"
 
+// Emqxdeploy - emqx deploy type
+type Emqxdeploy string
+
 var (
-	Version = "dev"
-	Is_EE   = false
+	Version              = "dev"
+	IsPro                = false
+	ErrLicenseValidation error
+	EmqxCloudDeploy      Emqxdeploy = "cloud"
+	EmqxOnPremDeploy     Emqxdeploy = "on-prem"
 )
 
 // SetHost - sets the host ip
@@ -43,7 +50,6 @@ func GetServerConfig() config.ServerConfig {
 	cfg.AllowedOrigin = GetAllowedOrigin()
 	cfg.RestBackend = "off"
 	cfg.NodeID = GetNodeID()
-	cfg.StunPort = GetStunPort()
 	cfg.BrokerType = GetBrokerType()
 	cfg.EmqxRestEndpoint = GetEmqxRestEndpoint()
 	if AutoUpdateEnabled() {
@@ -69,6 +75,7 @@ func GetServerConfig() config.ServerConfig {
 	cfg.Database = GetDB()
 	cfg.Platform = GetPlatform()
 	cfg.Version = GetVersion()
+	cfg.PublicIp = GetServerHostIP()
 
 	// == auth config ==
 	var authInfo = GetAuthProviderInfo()
@@ -78,71 +85,67 @@ func GetServerConfig() config.ServerConfig {
 	cfg.FrontendURL = GetFrontendURL()
 	cfg.Telemetry = Telemetry()
 	cfg.Server = GetServer()
-	cfg.StunList = GetStunListString()
 	cfg.Verbosity = GetVerbosity()
-	cfg.IsEE = "no"
-	if Is_EE {
-		cfg.IsEE = "yes"
+	cfg.IsPro = "no"
+	if IsPro {
+		cfg.IsPro = "yes"
 	}
-	cfg.DefaultProxyMode = GetDefaultProxyMode()
-
+	cfg.JwtValidityDuration = GetJwtValidityDuration()
+	cfg.RacAutoDisable = GetRacAutoDisable()
+	cfg.MetricInterval = GetMetricInterval()
+	cfg.ManageDNS = GetManageDNS()
+	cfg.Stun = IsStunEnabled()
+	cfg.StunServers = GetStunServers()
+	cfg.DefaultDomain = GetDefaultDomain()
 	return cfg
 }
 
-// GetServerConfig - gets the server config into memory from file or env
+// GetJwtValidityDuration - returns the JWT validity duration in seconds
+func GetJwtValidityDuration() time.Duration {
+	var defaultDuration = time.Duration(24) * time.Hour
+	if os.Getenv("JWT_VALIDITY_DURATION") != "" {
+		t, err := strconv.Atoi(os.Getenv("JWT_VALIDITY_DURATION"))
+		if err != nil {
+			return defaultDuration
+		}
+		return time.Duration(t) * time.Second
+	}
+	return defaultDuration
+}
+
+// GetRacAutoDisable - returns whether the feature to autodisable RAC is enabled
+func GetRacAutoDisable() bool {
+	return os.Getenv("RAC_AUTO_DISABLE") == "true"
+}
+
+// GetServerInfo - gets the server config into memory from file or env
 func GetServerInfo() models.ServerConfig {
 	var cfg models.ServerConfig
 	cfg.Server = GetServer()
-	cfg.MQUserName = GetMqUserName()
-	cfg.MQPassword = GetMqPassword()
+	if GetBrokerType() == EmqxBrokerType {
+		cfg.MQUserName = "HOST_ID"
+		cfg.MQPassword = "HOST_PASS"
+	} else {
+		cfg.MQUserName = GetMqUserName()
+		cfg.MQPassword = GetMqPassword()
+	}
 	cfg.API = GetAPIConnString()
 	cfg.CoreDNSAddr = GetCoreDNSAddr()
 	cfg.APIPort = GetAPIPort()
 	cfg.DNSMode = "off"
 	cfg.Broker = GetPublicBrokerEndpoint()
+	cfg.BrokerType = GetBrokerType()
 	if IsDNSMode() {
 		cfg.DNSMode = "on"
 	}
 	cfg.Version = GetVersion()
-	cfg.Is_EE = Is_EE
-	cfg.StunPort = GetStunPort()
-	cfg.StunList = GetStunList()
-	cfg.TurnDomain = GetTurnHost()
-	cfg.TurnPort = GetTurnPort()
-	cfg.UseTurn = IsUsingTurn()
+	cfg.IsPro = IsPro
+	cfg.MetricInterval = GetMetricInterval()
+	cfg.ManageDNS = GetManageDNS()
+	cfg.Stun = IsStunEnabled()
+	cfg.StunServers = GetStunServers()
+	cfg.DefaultDomain = GetDefaultDomain()
 	return cfg
-}
-
-// GetTurnHost - fetches the turn host domain
-func GetTurnHost() string {
-	turnServer := ""
-	if os.Getenv("TURN_SERVER_HOST") != "" {
-		turnServer = os.Getenv("TURN_SERVER_HOST")
-	} else if config.Config.Server.TurnServer != "" {
-		turnServer = config.Config.Server.TurnServer
-	}
-	return turnServer
-}
-
-// IsUsingTurn - check if server has turn configured
-func IsUsingTurn() (b bool) {
-	if os.Getenv("USE_TURN") != "" {
-		b = os.Getenv("USE_TURN") == "true"
-	} else {
-		b = config.Config.Server.UseTurn
-	}
-	return
-}
-
-// GetTurnApiHost - fetches the turn api host domain
-func GetTurnApiHost() string {
-	turnApiServer := ""
-	if os.Getenv("TURN_SERVER_API_HOST") != "" {
-		turnApiServer = os.Getenv("TURN_SERVER_API_HOST")
-	} else if config.Config.Server.TurnApiServer != "" {
-		turnApiServer = config.Config.Server.TurnApiServer
-	}
-	return turnApiServer
 }
 
 // GetFrontendURL - gets the frontend url
@@ -177,6 +180,11 @@ func GetVersion() string {
 	return Version
 }
 
+// GetServerHostIP - fetches server IP
+func GetServerHostIP() string {
+	return os.Getenv("SERVER_HOST")
+}
+
 // GetDB - gets the database type
 func GetDB() string {
 	database := "sqlite"
@@ -186,6 +194,17 @@ func GetDB() string {
 		database = config.Config.Server.Database
 	}
 	return database
+}
+
+// CacheEnabled - checks if cache is enabled
+func CacheEnabled() bool {
+	caching := true
+	if os.Getenv("CACHING_ENABLED") == "false" {
+		caching = false
+	} else if config.Config.Server.CacheEnabled == "false" {
+		caching = false
+	}
+	return caching
 }
 
 // GetAPIHost - gets the api host
@@ -217,46 +236,6 @@ func GetAPIPort() string {
 	return apiport
 }
 
-// GetStunList - gets the stun servers
-func GetStunList() []models.StunServer {
-	stunList := []models.StunServer{
-		{
-			Domain: "stun1.netmaker.io",
-			Port:   3478,
-		},
-		{
-			Domain: "stun2.netmaker.io",
-			Port:   3478,
-		},
-	}
-	parsed := false
-	if os.Getenv("STUN_LIST") != "" {
-		stuns, err := parseStunList(os.Getenv("STUN_LIST"))
-		if err == nil {
-			parsed = true
-			stunList = stuns
-		}
-	}
-	if !parsed && config.Config.Server.StunList != "" {
-		stuns, err := parseStunList(config.Config.Server.StunList)
-		if err == nil {
-			stunList = stuns
-		}
-	}
-	return stunList
-}
-
-// GetStunList - gets the stun servers w/o parsing to struct
-func GetStunListString() string {
-	stunList := "stun1.netmaker.io:3478,stun2.netmaker.io:3478"
-	if os.Getenv("STUN_LIST") != "" {
-		stunList = os.Getenv("STUN_LIST")
-	} else if config.Config.Server.StunList != "" {
-		stunList = config.Config.Server.StunList
-	}
-	return stunList
-}
-
 // GetCoreDNSAddr - gets the core dns address
 func GetCoreDNSAddr() string {
 	addr, _ := GetPublicIP()
@@ -275,6 +254,64 @@ func GetPublicBrokerEndpoint() string {
 	} else {
 		return config.Config.Server.Broker
 	}
+}
+
+func GetSmtpHost() string {
+	v := ""
+	if fromEnv := os.Getenv("SMTP_HOST"); fromEnv != "" {
+		v = fromEnv
+	} else if fromCfg := config.Config.Server.SmtpHost; fromCfg != "" {
+		v = fromCfg
+	}
+	return v
+}
+
+func GetSmtpPort() int {
+	v := 587
+	if fromEnv := os.Getenv("SMTP_PORT"); fromEnv != "" {
+		port, err := strconv.Atoi(fromEnv)
+		if err == nil {
+			v = port
+		}
+	} else if fromCfg := config.Config.Server.SmtpPort; fromCfg != 0 {
+		v = fromCfg
+	}
+	return v
+}
+
+func GetSenderEmail() string {
+	v := ""
+	if fromEnv := os.Getenv("EMAIL_SENDER_ADDR"); fromEnv != "" {
+		v = fromEnv
+	} else if fromCfg := config.Config.Server.EmailSenderAddr; fromCfg != "" {
+		v = fromCfg
+	}
+	return v
+}
+
+func GetSenderUser() string {
+	v := ""
+	if fromEnv := os.Getenv("EMAIL_SENDER_USER"); fromEnv != "" {
+		v = fromEnv
+	} else if fromCfg := config.Config.Server.EmailSenderUser; fromCfg != "" {
+		v = fromCfg
+	}
+	return v
+}
+
+func GetEmaiSenderPassword() string {
+	v := ""
+	if fromEnv := os.Getenv("EMAIL_SENDER_PASSWORD"); fromEnv != "" {
+		v = fromEnv
+	} else if fromCfg := config.Config.Server.EmailSenderPassword; fromCfg != "" {
+		v = fromCfg
+	}
+	return v
+}
+
+// GetOwnerEmail - gets the owner email (saas)
+func GetOwnerEmail() string {
+	return os.Getenv("SAAS_OWNER_EMAIL")
 }
 
 // GetMessageQueueEndpoint - gets the message queue endpoint
@@ -310,17 +347,6 @@ func GetMasterKey() string {
 		key = os.Getenv("MASTER_KEY")
 	} else if config.Config.Server.MasterKey != "" {
 		key = config.Config.Server.MasterKey
-	}
-	return key
-}
-
-// GetDNSKey - gets the configured dns key of server
-func GetDNSKey() string {
-	key := ""
-	if os.Getenv("DNS_KEY") != "" {
-		key = os.Getenv("DNS_KEY")
-	} else if config.Config.Server.DNSKey != "" {
-		key = config.Config.Server.DNSKey
 	}
 	return key
 }
@@ -483,7 +509,7 @@ func GetPublicIP() (string, error) {
 	endpoint := ""
 	var err error
 
-	iplist := []string{"https://ip.server.gravitl.com", "https://ifconfig.me", "https://api.ipify.org", "https://ipinfo.io/ip"}
+	iplist := []string{"https://ifconfig.me", "https://api.ipify.org", "https://ipinfo.io/ip"}
 	publicIpService := os.Getenv("PUBLIC_IP_SERVICE")
 	if publicIpService != "" {
 		// prepend the user-specified service so it's checked first
@@ -513,7 +539,7 @@ func GetPublicIP() (string, error) {
 			break
 		}
 	}
-	if err == nil && endpoint == "" {
+	if endpoint == "" {
 		err = errors.New("public address not found")
 	}
 	return endpoint, err
@@ -628,6 +654,68 @@ func GetMqUserName() string {
 	return password
 }
 
+// GetMetricInterval - get the publish metric interval
+func GetMetricIntervalInMinutes() time.Duration {
+	//default 15 minutes
+	mi := "15"
+	if os.Getenv("PUBLISH_METRIC_INTERVAL") != "" {
+		mi = os.Getenv("PUBLISH_METRIC_INTERVAL")
+	}
+	interval, err := strconv.Atoi(mi)
+	if err != nil {
+		interval = 15
+	}
+
+	return time.Duration(interval) * time.Minute
+}
+
+// GetMetricInterval - get the publish metric interval
+func GetMetricInterval() string {
+	//default 15 minutes
+	mi := "15"
+	if os.Getenv("PUBLISH_METRIC_INTERVAL") != "" {
+		mi = os.Getenv("PUBLISH_METRIC_INTERVAL")
+	}
+	return mi
+}
+
+// GetManageDNS - if manage DNS enabled or not
+func GetManageDNS() bool {
+	enabled := false
+	if os.Getenv("MANAGE_DNS") != "" {
+		enabled = os.Getenv("MANAGE_DNS") == "true"
+	}
+	return enabled
+}
+
+func IsOldAclEnabled() bool {
+	enabled := true
+	if os.Getenv("OLD_ACL_SUPPORT") != "" {
+		enabled = os.Getenv("OLD_ACL_SUPPORT") == "true"
+	}
+	return enabled
+}
+
+// GetDefaultDomain - get the default domain
+func GetDefaultDomain() string {
+	//default hosted.nm
+	var domain string
+	if os.Getenv("DEFAULT_DOMAIN") != "" {
+		if validateDomain(os.Getenv("DEFAULT_DOMAIN")) {
+			domain = os.Getenv("DEFAULT_DOMAIN")
+		}
+	}
+	return domain
+}
+
+func validateDomain(domain string) bool {
+	domainPattern := `[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}(\.[a-zA-Z0-9][a-zA-Z0-9_-]{0,62})*(\.[a-zA-Z][a-zA-Z0-9]{0,10}){1}`
+
+	exp := regexp.MustCompile("^" + domainPattern + "$")
+
+	return exp.MatchString(domain)
+}
+
 // GetEmqxRestEndpoint - returns the REST API Endpoint of EMQX
 func GetEmqxRestEndpoint() string {
 	return os.Getenv("EMQX_REST_ENDPOINT")
@@ -653,130 +741,133 @@ func GetLicenseKey() string {
 	return licenseKeyValue
 }
 
-// GetNetmakerAccountID - get's the associated, Netmaker, account ID to verify ownership
-func GetNetmakerAccountID() string {
-	netmakerAccountID := os.Getenv("NETMAKER_ACCOUNT_ID")
-	if netmakerAccountID == "" {
-		netmakerAccountID = config.Config.Server.NetmakerAccountID
+// GetNetmakerTenantID - get's the associated, Netmaker, tenant ID to verify ownership
+func GetNetmakerTenantID() string {
+	netmakerTenantID := os.Getenv("NETMAKER_TENANT_ID")
+	if netmakerTenantID == "" {
+		netmakerTenantID = config.Config.Server.NetmakerTenantID
 	}
-	return netmakerAccountID
+	return netmakerTenantID
 }
 
-// GetStunPort - Get the port to run the stun server on
-func GetStunPort() int {
-	port := 3478 //default
-	if os.Getenv("STUN_PORT") != "" {
-		portInt, err := strconv.Atoi(os.Getenv("STUN_PORT"))
-		if err == nil {
-			port = portInt
-		}
-	} else if config.Config.Server.StunPort != 0 {
-		port = config.Config.Server.StunPort
-	}
-	return port
-}
-
-// GetTurnPort - Get the port to run the turn server on
-func GetTurnPort() int {
-	port := 3479 //default
-	if os.Getenv("TURN_PORT") != "" {
-		portInt, err := strconv.Atoi(os.Getenv("TURN_PORT"))
-		if err == nil {
-			port = portInt
-		}
-	} else if config.Config.Server.TurnPort != 0 {
-		port = config.Config.Server.TurnPort
-	}
-	return port
-}
-
-// GetTurnUserName - fetches the turn server username
-func GetTurnUserName() string {
-	userName := ""
-	if os.Getenv("TURN_USERNAME") != "" {
-		userName = os.Getenv("TURN_USERNAME")
+// GetUserLimit - fetches free tier limits on users
+func GetUserLimit() int {
+	var userslimit int
+	if os.Getenv("USERS_LIMIT") != "" {
+		userslimit, _ = strconv.Atoi(os.Getenv("USERS_LIMIT"))
 	} else {
-		userName = config.Config.Server.TurnUserName
+		userslimit = config.Config.Server.UsersLimit
 	}
-	return userName
-
+	return userslimit
 }
 
-// GetTurnPassword - fetches the turn server password
-func GetTurnPassword() string {
-	pass := ""
-	if os.Getenv("TURN_PASSWORD") != "" {
-		pass = os.Getenv("TURN_PASSWORD")
+// GetNetworkLimit - fetches free tier limits on networks
+func GetNetworkLimit() int {
+	var networkslimit int
+	if os.Getenv("NETWORKS_LIMIT") != "" {
+		networkslimit, _ = strconv.Atoi(os.Getenv("NETWORKS_LIMIT"))
 	} else {
-		pass = config.Config.Server.TurnPassword
+		networkslimit = config.Config.Server.NetworksLimit
 	}
-	return pass
-
+	return networkslimit
 }
 
-// IsProxyEnabled - is proxy on or off
-func IsProxyEnabled() bool {
-	var enabled = false //default
-	if os.Getenv("PROXY") != "" {
-		enabled = os.Getenv("PROXY") == "on"
-	} else if config.Config.Server.Proxy != "" {
-		enabled = config.Config.Server.Proxy == "on"
+// GetMachinesLimit - fetches free tier limits on machines (clients + hosts)
+func GetMachinesLimit() int {
+	if l, err := strconv.Atoi(os.Getenv("MACHINES_LIMIT")); err == nil {
+		return l
+	}
+	return config.Config.Server.MachinesLimit
+}
+
+// GetIngressLimit - fetches free tier limits on ingresses
+func GetIngressLimit() int {
+	if l, err := strconv.Atoi(os.Getenv("INGRESSES_LIMIT")); err == nil {
+		return l
+	}
+	return config.Config.Server.IngressesLimit
+}
+
+// GetEgressLimit - fetches free tier limits on egresses
+func GetEgressLimit() int {
+	if l, err := strconv.Atoi(os.Getenv("EGRESSES_LIMIT")); err == nil {
+		return l
+	}
+	return config.Config.Server.EgressesLimit
+}
+
+// DeployedByOperator - returns true if the instance is deployed by netmaker operator
+func DeployedByOperator() bool {
+	if os.Getenv("DEPLOYED_BY_OPERATOR") != "" {
+		return os.Getenv("DEPLOYED_BY_OPERATOR") == "true"
+	}
+	return config.Config.Server.DeployedByOperator
+}
+
+// IsEndpointDetectionEnabled - returns true if endpoint detection enabled
+func IsEndpointDetectionEnabled() bool {
+	var enabled = true //default
+	if os.Getenv("ENDPOINT_DETECTION") != "" {
+		enabled = os.Getenv("ENDPOINT_DETECTION") == "true"
 	}
 	return enabled
 }
 
-// GetDefaultProxyMode - default proxy mode for a server
-func GetDefaultProxyMode() config.ProxyMode {
-	var (
-		mode config.ProxyMode
-		def  string
-	)
-	if os.Getenv("DEFAULT_PROXY_MODE") != "" {
-		def = os.Getenv("DEFAULT_PROXY_MODE")
-	} else if config.Config.Server.DefaultProxyMode.Set {
-		return config.Config.Server.DefaultProxyMode
+// IsStunEnabled - returns true if STUN set to on
+func IsStunEnabled() bool {
+	var enabled = true
+	if os.Getenv("STUN") != "" {
+		enabled = os.Getenv("STUN") == "true"
 	}
-	switch strings.ToUpper(def) {
-	case "ON":
-		mode.Set = true
-		mode.Value = true
-	case "OFF":
-		mode.Set = true
-		mode.Value = false
-	// AUTO or any other value
-	default:
-		mode.Set = false
-	}
-	return mode
-
+	return enabled
 }
 
-// parseStunList - turn string into slice of StunServers
-func parseStunList(stunString string) ([]models.StunServer, error) {
-	var err error
-	stunServers := []models.StunServer{}
-	stuns := strings.Split(stunString, ",")
-	if len(stuns) == 0 {
-		return stunServers, errors.New("no stun servers provided")
-	}
-	for _, stun := range stuns {
-		stun = strings.Trim(stun, " ")
-		stunInfo := strings.Split(stun, ":")
-		if len(stunInfo) != 2 {
-			continue
-		}
-		port, err := strconv.Atoi(stunInfo[1])
-		if err != nil || port == 0 {
-			continue
-		}
-		stunServers = append(stunServers, models.StunServer{
-			Domain: stunInfo[0],
-			Port:   port,
-		})
+func GetStunServers() string {
+	return os.Getenv("STUN_SERVERS")
+}
 
+// GetEnvironment returns the environment the server is running in (e.g. dev, staging, prod...)
+func GetEnvironment() string {
+	if env := os.Getenv("ENVIRONMENT"); env != "" {
+		return env
 	}
-	if len(stunServers) == 0 {
-		err = errors.New("no stun entries parsable")
+	if env := config.Config.Server.Environment; env != "" {
+		return env
 	}
-	return stunServers, err
+	return ""
+}
+
+// GetEmqxDeployType - fetches emqx deploy type this server uses
+func GetEmqxDeployType() (deployType Emqxdeploy) {
+	deployType = EmqxOnPremDeploy
+	if os.Getenv("EMQX_DEPLOY_TYPE") == string(EmqxCloudDeploy) {
+		deployType = EmqxCloudDeploy
+	}
+	return
+}
+
+// GetEmqxAppID - gets the emqx cloud app id
+func GetEmqxAppID() string {
+	return os.Getenv("EMQX_APP_ID")
+}
+
+// GetEmqxAppSecret - gets the emqx cloud app secret
+func GetEmqxAppSecret() string {
+	return os.Getenv("EMQX_APP_SECRET")
+}
+
+// GetAllowedEmailDomains - gets the allowed email domains for oauth signup
+func GetAllowedEmailDomains() string {
+	allowedDomains := "*"
+	if os.Getenv("ALLOWED_EMAIL_DOMAINS") != "" {
+		allowedDomains = os.Getenv("ALLOWED_EMAIL_DOMAINS")
+	} else if config.Config.Server.AllowedEmailDomains != "" {
+		allowedDomains = config.Config.Server.AllowedEmailDomains
+	}
+	return allowedDomains
+}
+
+// GetNmBaseDomain - fetches nm base domain
+func GetNmBaseDomain() string {
+	return os.Getenv("NM_DOMAIN")
 }

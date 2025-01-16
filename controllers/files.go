@@ -6,14 +6,12 @@ import (
 	"github.com/gorilla/mux"
 )
 
+// @Summary     Retrieve a file from the file server
+// @Router      /meshclient/files/{filename}  [get]
+// @Tags        Meshclient
+// @Success     200 {body} file "file"
+// @Failure     404 {string} string "404 not found"
 func fileHandlers(r *mux.Router) {
-	// swagger:route GET /meshclient/files/{filename} meshclient fileServer
-	//
-	// Retrieve a file from the file server.
-	//
-	//		Schemes: https
-	//
-	// 		Security:
-	//   		oauth
-	r.PathPrefix("/meshclient/files").Handler(http.StripPrefix("/meshclient/files", http.FileServer(http.Dir("./meshclient/files"))))
+	r.PathPrefix("/meshclient/files").
+		Handler(http.StripPrefix("/meshclient/files", http.FileServer(http.Dir("./meshclient/files"))))
 }

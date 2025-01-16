@@ -3,7 +3,6 @@ package auth
 import (
 	"encoding/json"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -15,6 +14,7 @@ import (
 	"github.com/gravitl/netmaker/models"
 	"github.com/gravitl/netmaker/mq"
 	"github.com/gravitl/netmaker/servercfg"
+	"golang.org/x/exp/slog"
 )
 
 // SessionHandler - called by the HTTP router when user
@@ -58,12 +58,12 @@ func SessionHandler(conn *websocket.Conn) {
 		logger.Log(0, "Failed to process sso request -", err.Error())
 		return
 	}
+	defer netcache.Del(stateStr)
 	// Wait for the user to finish his auth flow...
-	timeout := make(chan bool, 1)
+	timeout := make(chan bool, 2)
 	answer := make(chan netcache.CValue, 1)
 	defer close(answer)
 	defer close(timeout)
-
 	if len(registerMessage.User) > 0 { // handle basic auth
 		logger.Log(0, "user registration attempted with host:", registerMessage.RegisterHost.Name, "user:", registerMessage.User)
 
@@ -85,6 +85,24 @@ func SessionHandler(conn *websocket.Conn) {
 			return
 		}
 		req.Pass = req.Host.ID.String()
+		// user, err := logic.GetUser(req.User)
+		// if err != nil {
+		// 	logger.Log(0, "failed to get user", req.User, "from database")
+		// 	err = conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+		// 	if err != nil {
+		// 		logger.Log(0, "error during message writing:", err.Error())
+		// 	}
+		// 	return
+		// }
+		// if !user.IsAdmin && !user.IsSuperAdmin {
+		// 	logger.Log(0, "user", req.User, "is neither an admin or superadmin. denying registeration")
+		// 	conn.WriteMessage(messageType, []byte("cannot register with a non-admin or non-superadmin"))
+		// 	err = conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+		// 	if err != nil {
+		// 		logger.Log(0, "error during message writing:", err.Error())
+		// 	}
+		// 	return
+		// }
 
 		if err = netcache.Set(stateStr, req); err != nil { // give the user's host access in the DB
 			logger.Log(0, "machine failed to complete join on network,", registerMessage.Network, "-", err.Error())
@@ -92,6 +110,10 @@ func SessionHandler(conn *websocket.Conn) {
 		}
 	} else { // handle SSO / OAuth
 		if auth_provider == nil {
+			err = conn.WriteMessage(messageType, []byte("Oauth not configured"))
+			if err != nil {
+				logger.Log(0, "error during message writing:", err.Error())
+			}
 			err = conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
 			if err != nil {
 				logger.Log(0, "error during message writing:", err.Error())
@@ -99,7 +121,7 @@ func SessionHandler(conn *websocket.Conn) {
 			return
 		}
 		logger.Log(0, "user registration attempted with host:", registerMessage.RegisterHost.Name, "via SSO")
-		redirectUrl = fmt.Sprintf("https://%s/api/oauth/register/%s", servercfg.GetAPIConnString(), stateStr)
+		redirectUrl := fmt.Sprintf("https://%s/api/oauth/register/%s", servercfg.GetAPIConnString(), stateStr)
 		err = conn.WriteMessage(messageType, []byte(redirectUrl))
 		if err != nil {
 			logger.Log(0, "error during message writing:", err.Error())
@@ -108,35 +130,38 @@ func SessionHandler(conn *websocket.Conn) {
 
 	go func() {
 		for {
+			msgType, _, err := conn.ReadMessage()
+			if err != nil || msgType == websocket.CloseMessage {
+				netcache.Del(stateStr)
+				return
+			}
+		}
+	}()
+
+	go func() {
+		for {
 			cachedReq, err := netcache.Get(stateStr)
 			if err != nil {
-				if strings.Contains(err.Error(), "expired") {
-					logger.Log(1, "timeout occurred while waiting for SSO registration")
-					timeout <- true
-					break
-				}
-				continue
+				logger.Log(0, "oauth state has been deleted ", err.Error())
+				timeout <- true
+				break
+
 			} else if len(cachedReq.User) > 0 {
 				logger.Log(0, "host SSO process completed for user", cachedReq.User)
 				answer <- *cachedReq
 				break
 			}
-			time.Sleep(500) // try it 2 times per second to see if auth is completed
+			time.Sleep(time.Second)
 		}
 	}()
 
 	select {
 	case result := <-answer: // a read from req.answerCh has occurred
 		// add the host, if not exists, handle like enrollment registration
-		hostPass := result.Host.HostPass
 		if !logic.HostExists(&result.Host) { // check if host already exists, add if not
 			if servercfg.GetBrokerType() == servercfg.EmqxBrokerType {
-				if err := mq.CreateEmqxUser(result.Host.ID.String(), result.Host.HostPass, false); err != nil {
+				if err := mq.GetEmqxHandler().CreateEmqxUser(result.Host.ID.String(), result.Host.HostPass); err != nil {
 					logger.Log(0, "failed to create host credentials for EMQX: ", err.Error())
-					return
-				}
-				if err := mq.CreateHostACL(result.Host.ID.String(), servercfg.GetServerInfo().Server); err != nil {
-					logger.Log(0, "failed to add host ACL rules to EMQX: ", err.Error())
 					return
 				}
 			}
@@ -172,7 +197,7 @@ func SessionHandler(conn *websocket.Conn) {
 		for _, newNet := range currentNetworks {
 			if !logic.StringSliceContains(hostNets, newNet) {
 				if len(result.User) > 0 {
-					_, err := isUserIsAllowed(result.User, newNet, false)
+					_, err := isUserIsAllowed(result.User, newNet)
 					if err != nil {
 						logger.Log(0, "unauthorized user", result.User, "attempted to register to network", newNet)
 						handleHostRegErr(conn, err)
@@ -184,11 +209,6 @@ func SessionHandler(conn *websocket.Conn) {
 		}
 		server := servercfg.GetServerInfo()
 		server.TrafficKey = key
-		if servercfg.GetBrokerType() == servercfg.EmqxBrokerType {
-			// set MQ username and password for EMQX clients
-			server.MQUserName = result.Host.ID.String()
-			server.MQPassword = hostPass
-		}
 		result.Host.HostPass = ""
 		response := models.RegisterResponse{
 			ServerConf:    server,
@@ -202,15 +222,10 @@ func SessionHandler(conn *websocket.Conn) {
 		if err = conn.WriteMessage(messageType, reponseData); err != nil {
 			logger.Log(0, "error during message writing:", err.Error())
 		}
-		go CheckNetRegAndHostUpdate(netsToAdd[:], &result.Host)
+		go CheckNetRegAndHostUpdate(netsToAdd[:], &result.Host, uuid.Nil, []models.TagID{})
 	case <-timeout: // the read from req.answerCh has timed out
-		if err = conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "")); err != nil {
-			logger.Log(0, "error during timeout message writing:", err.Error())
-		}
-	}
-	// The entry is not needed anymore, but we will let the producer to close it to avoid panic cases
-	if err = netcache.Del(stateStr); err != nil {
-		logger.Log(0, "failed to remove node SSO cache entry", err.Error())
+		logger.Log(0, "timeout signal recv,exiting oauth socket conn")
+		break
 	}
 	// Cleanly close the connection by sending a close message and then
 	// waiting (with timeout) for the server to close the connection.
@@ -221,7 +236,7 @@ func SessionHandler(conn *websocket.Conn) {
 }
 
 // CheckNetRegAndHostUpdate - run through networks and send a host update
-func CheckNetRegAndHostUpdate(networks []string, h *models.Host) {
+func CheckNetRegAndHostUpdate(networks []string, h *models.Host, relayNodeId uuid.UUID, tags []models.TagID) {
 	// publish host update through MQ
 	for i := range networks {
 		network := networks[i]
@@ -231,12 +246,46 @@ func CheckNetRegAndHostUpdate(networks []string, h *models.Host) {
 				logger.Log(0, "failed to add host to network:", h.ID.String(), h.Name, network, err.Error())
 				continue
 			}
+			if len(tags) > 0 {
+				newNode.Tags = make(map[models.TagID]struct{})
+				for _, tagI := range tags {
+					newNode.Tags[tagI] = struct{}{}
+				}
+				logic.UpsertNode(newNode)
+			}
+
+			if relayNodeId != uuid.Nil && !newNode.IsRelayed {
+				// check if relay node exists and acting as relay
+				relaynode, err := logic.GetNodeByID(relayNodeId.String())
+				if err == nil && relaynode.IsRelay && relaynode.Network == newNode.Network {
+					slog.Info(fmt.Sprintf("adding relayed node %s to relay %s on network %s", newNode.ID.String(), relayNodeId.String(), network))
+					newNode.IsRelayed = true
+					newNode.RelayedBy = relayNodeId.String()
+					updatedRelayNode := relaynode
+					updatedRelayNode.RelayedNodes = append(updatedRelayNode.RelayedNodes, newNode.ID.String())
+					logic.UpdateRelayed(&relaynode, &updatedRelayNode)
+					if err := logic.UpsertNode(&updatedRelayNode); err != nil {
+						slog.Error("failed to update node", "nodeid", relayNodeId.String())
+					}
+					if err := logic.UpsertNode(newNode); err != nil {
+						slog.Error("failed to update node", "nodeid", relayNodeId.String())
+					}
+				} else {
+					slog.Error("failed to relay node. maybe specified relay node is actually not a relay? Or the relayed node is not in the same network with relay?", "err", err)
+				}
+			}
 			logger.Log(1, "added new node", newNode.ID.String(), "to host", h.Name)
 			hostactions.AddAction(models.HostUpdate{
 				Action: models.JoinHostToNetwork,
 				Host:   *h,
 				Node:   *newNode,
 			})
+			if h.IsDefault {
+				// make  host failover
+				logic.CreateFailOver(*newNode)
+				// make host remote access gateway
+				logic.CreateIngressGateway(network, newNode.ID.String(), models.IngressRequest{})
+			}
 		}
 	}
 	if servercfg.IsMessageQueueBackend() {
@@ -244,7 +293,7 @@ func CheckNetRegAndHostUpdate(networks []string, h *models.Host) {
 			Action: models.RequestAck,
 			Host:   *h,
 		})
-		if err := mq.PublishPeerUpdate(); err != nil {
+		if err := mq.PublishPeerUpdate(false); err != nil {
 			logger.Log(0, "failed to publish peer update during registration -", err.Error())
 		}
 	}

@@ -1,6 +1,7 @@
 package logic
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,17 +9,31 @@ import (
 
 	"github.com/go-playground/validator/v10"
 	"golang.org/x/crypto/bcrypt"
+	"golang.org/x/exp/slog"
 
 	"github.com/gravitl/netmaker/database"
 	"github.com/gravitl/netmaker/logger"
-	"github.com/gravitl/netmaker/logic/pro"
 	"github.com/gravitl/netmaker/models"
-	"github.com/gravitl/netmaker/models/promodels"
-	"github.com/gravitl/netmaker/servercfg"
 )
 
-// HasAdmin - checks if server has an admin
-func HasAdmin() (bool, error) {
+const (
+	auth_key = "netmaker_auth"
+)
+
+var (
+	superUser = models.User{}
+)
+
+func ClearSuperUserCache() {
+	superUser = models.User{}
+}
+
+// HasSuperAdmin - checks if server has an superadmin/owner
+func HasSuperAdmin() (bool, error) {
+
+	if superUser.IsSuperAdmin {
+		return true, nil
+	}
 
 	collection, err := database.FetchRecords(database.USERS_TABLE_NAME)
 	if err != nil {
@@ -34,7 +49,7 @@ func HasAdmin() (bool, error) {
 		if err != nil {
 			continue
 		}
-		if user.IsAdmin {
+		if user.PlatformRoleID == models.SuperAdminRole || user.IsSuperAdmin {
 			return true, nil
 		}
 	}
@@ -42,18 +57,28 @@ func HasAdmin() (bool, error) {
 	return false, err
 }
 
-// GetReturnUser - gets a user
-func GetReturnUser(username string) (models.ReturnUser, error) {
+// GetUsersDB - gets users
+func GetUsersDB() ([]models.User, error) {
 
-	var user models.ReturnUser
-	record, err := database.FetchRecord(database.USERS_TABLE_NAME, username)
+	var users []models.User
+
+	collection, err := database.FetchRecords(database.USERS_TABLE_NAME)
+
 	if err != nil {
-		return user, err
+		return users, err
 	}
-	if err = json.Unmarshal([]byte(record), &user); err != nil {
-		return models.ReturnUser{}, err
+
+	for _, value := range collection {
+
+		var user models.User
+		err = json.Unmarshal([]byte(value), &user)
+		if err != nil {
+			continue // get users
+		}
+		users = append(users, user)
 	}
-	return user, err
+
+	return users, err
 }
 
 // GetUsers - gets users
@@ -80,93 +105,102 @@ func GetUsers() ([]models.ReturnUser, error) {
 	return users, err
 }
 
+// IsOauthUser - returns
+func IsOauthUser(user *models.User) error {
+	var currentValue, err = FetchPassValue("")
+	if err != nil {
+		return err
+	}
+	var bCryptErr = bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(currentValue))
+	return bCryptErr
+}
+
+func FetchPassValue(newValue string) (string, error) {
+
+	type valueHolder struct {
+		Value string `json:"value" bson:"value"`
+	}
+	newValueHolder := valueHolder{}
+	var currentValue, err = FetchAuthSecret()
+	if err != nil {
+		return "", err
+	}
+	var unmarshErr = json.Unmarshal([]byte(currentValue), &newValueHolder)
+	if unmarshErr != nil {
+		return "", unmarshErr
+	}
+
+	var b64CurrentValue, b64Err = base64.StdEncoding.DecodeString(newValueHolder.Value)
+	if b64Err != nil {
+		logger.Log(0, "could not decode pass")
+		return "", nil
+	}
+	return string(b64CurrentValue), nil
+}
+
 // CreateUser - creates a user
 func CreateUser(user *models.User) error {
 	// check if user exists
 	if _, err := GetUser(user.UserName); err == nil {
 		return errors.New("user exists")
 	}
-	var err = ValidateUser(user)
-	if err != nil {
-		return err
+	SetUserDefaults(user)
+	if err := IsGroupsValid(user.UserGroups); err != nil {
+		return errors.New("invalid groups: " + err.Error())
+	}
+	if err := IsNetworkRolesValid(user.NetworkRoles); err != nil {
+		return errors.New("invalid network roles: " + err.Error())
 	}
 
+	var err = ValidateUser(user)
+	if err != nil {
+		logger.Log(0, "failed to validate user", err.Error())
+		return err
+	}
 	// encrypt that password so we never see it again
 	hash, err := bcrypt.GenerateFromPassword([]byte(user.Password), 5)
 	if err != nil {
+		logger.Log(0, "error encrypting pass", err.Error())
 		return err
 	}
 	// set password to encrypted password
 	user.Password = string(hash)
-
-	tokenString, _ := CreateProUserJWT(user.UserName, user.Networks, user.Groups, user.IsAdmin)
-	if tokenString == "" {
-		// logic.ReturnErrorResponse(w, r, errorResponse)
+	user.AuthType = models.BasicAuth
+	if IsOauthUser(user) == nil {
+		user.AuthType = models.OAuth
+	}
+	_, err = CreateUserJWT(user.UserName, user.PlatformRoleID)
+	if err != nil {
+		logger.Log(0, "failed to generate token", err.Error())
 		return err
 	}
-
-	SetUserDefaults(user)
 
 	// connect db
 	data, err := json.Marshal(user)
 	if err != nil {
+		logger.Log(0, "failed to marshal", err.Error())
 		return err
 	}
 	err = database.Insert(user.UserName, string(data), database.USERS_TABLE_NAME)
 	if err != nil {
+		logger.Log(0, "failed to insert user", err.Error())
 		return err
 	}
-
-	// == PRO == Add user to every network as network user ==
-	currentNets, err := GetNetworks()
-	if err != nil {
-		currentNets = []models.Network{}
-	}
-	for i := range currentNets {
-		newUser := promodels.NetworkUser{
-			ID:      promodels.NetworkUserID(user.UserName),
-			Clients: []string{},
-			Nodes:   []string{},
-		}
-
-		pro.AddProNetDefaults(&currentNets[i])
-		if pro.IsUserAllowed(&currentNets[i], user.UserName, user.Groups) {
-			newUser.AccessLevel = currentNets[i].ProSettings.DefaultAccessLevel
-			newUser.ClientLimit = currentNets[i].ProSettings.DefaultUserClientLimit
-			newUser.NodeLimit = currentNets[i].ProSettings.DefaultUserNodeLimit
-		} else {
-			newUser.AccessLevel = pro.NO_ACCESS
-			newUser.ClientLimit = 0
-			newUser.NodeLimit = 0
-		}
-
-		// legacy
-		if StringSliceContains(user.Networks, currentNets[i].NetID) {
-			if !servercfg.Is_EE {
-				newUser.AccessLevel = pro.NET_ADMIN
-			}
-		}
-		userErr := pro.CreateNetworkUser(&currentNets[i], &newUser)
-		if userErr != nil {
-			logger.Log(0, "failed to add network user data on network", currentNets[i].NetID, "for user", user.UserName)
-		}
-	}
-	// == END PRO ==
-
+	AddGlobalNetRolesToAdmins(*user)
 	return nil
 }
 
-// CreateAdmin - creates an admin user
-func CreateAdmin(admin *models.User) error {
-	hasadmin, err := HasAdmin()
+// CreateSuperAdmin - creates an super admin user
+func CreateSuperAdmin(u *models.User) error {
+	hassuperadmin, err := HasSuperAdmin()
 	if err != nil {
 		return err
 	}
-	if hasadmin {
-		return errors.New("admin user already exists")
+	if hassuperadmin {
+		return errors.New("superadmin user already exists")
 	}
-	admin.IsAdmin = true
-	return CreateUser(admin)
+	u.PlatformRoleID = models.SuperAdminRole
+	return CreateUser(u)
 }
 
 // VerifyAuthRequest - verifies an auth request
@@ -180,7 +214,7 @@ func VerifyAuthRequest(authRequest models.UserAuthParams) (string, error) {
 	// Search DB for node with Mac Address. Ignore pending nodes (they should not be able to authenticate with API until approved).
 	record, err := database.FetchRecord(database.USERS_TABLE_NAME, authRequest.UserName)
 	if err != nil {
-		return "", errors.New("error retrieving user from db: " + err.Error())
+		return "", errors.New("incorrect credentials")
 	}
 	if err = json.Unmarshal([]byte(record), &result); err != nil {
 		return "", errors.New("error unmarshalling user json: " + err.Error())
@@ -194,65 +228,38 @@ func VerifyAuthRequest(authRequest models.UserAuthParams) (string, error) {
 	}
 
 	// Create a new JWT for the node
-	tokenString, _ := CreateProUserJWT(authRequest.UserName, result.Networks, result.Groups, result.IsAdmin)
+	tokenString, err := CreateUserJWT(authRequest.UserName, result.PlatformRoleID)
+	if err != nil {
+		slog.Error("error creating jwt", "error", err)
+		return "", err
+	}
+
+	// update last login time
+	result.LastLoginTime = time.Now()
+	err = UpsertUser(result)
+	if err != nil {
+		slog.Error("error upserting user", "error", err)
+		return "", err
+	}
+
 	return tokenString, nil
 }
 
-// UpdateUserNetworks - updates the networks of a given user
-func UpdateUserNetworks(newNetworks, newGroups []string, isadmin bool, currentUser *models.ReturnUser) error {
-	// check if user exists
-	returnedUser, err := GetUser(currentUser.UserName)
+// UpsertUser - updates user in the db
+func UpsertUser(user models.User) error {
+	data, err := json.Marshal(&user)
 	if err != nil {
+		slog.Error("error marshalling user", "user", user.UserName, "error", err.Error())
 		return err
-	} else if returnedUser.IsAdmin {
-		return fmt.Errorf("can not make changes to an admin user, attempted to change %s", returnedUser.UserName)
 	}
-	if isadmin {
-		currentUser.IsAdmin = true
-		currentUser.Networks = nil
-	} else {
-		// == PRO ==
-		currentUser.Groups = newGroups
-		for _, n := range newNetworks {
-			if !StringSliceContains(currentUser.Networks, n) {
-				// make net admin of any network not previously assigned
-				pro.MakeNetAdmin(n, currentUser.UserName)
-			}
-		}
-		// Compare networks, find networks not in previous
-		for _, n := range currentUser.Networks {
-			if !StringSliceContains(newNetworks, n) {
-				// if user was removed from a network, re-assign access to net default level
-				if network, err := GetNetwork(n); err == nil {
-					if network.ProSettings != nil {
-						ok := pro.AssignAccessLvl(n, currentUser.UserName, network.ProSettings.DefaultAccessLevel)
-						if ok {
-							logger.Log(0, "changed", currentUser.UserName, "access level on network", network.NetID, "to", fmt.Sprintf("%d", network.ProSettings.DefaultAccessLevel))
-						}
-					}
-				}
-			}
-		}
-
-		if err := AdjustGroupPermissions(currentUser); err != nil {
-			logger.Log(0, "failed to update user", currentUser.UserName, "after group update", err.Error())
-		}
-		// == END PRO ==
-
-		currentUser.Networks = newNetworks
+	if err = database.Insert(user.UserName, string(data), database.USERS_TABLE_NAME); err != nil {
+		slog.Error("error inserting user", "user", user.UserName, "error", err.Error())
+		return err
 	}
-
-	userChange := models.User{
-		UserName: currentUser.UserName,
-		Networks: currentUser.Networks,
-		IsAdmin:  currentUser.IsAdmin,
-		Password: "",
-		Groups:   currentUser.Groups,
+	if user.IsSuperAdmin {
+		superUser = user
 	}
-
-	_, err = UpdateUser(&userChange, returnedUser)
-
-	return err
+	return nil
 }
 
 // UpdateUser - updates a given user
@@ -263,17 +270,17 @@ func UpdateUser(userchange, user *models.User) (*models.User, error) {
 	}
 
 	queryUser := user.UserName
-
-	if userchange.UserName != "" {
+	if userchange.UserName != "" && user.UserName != userchange.UserName {
+		// check if username is available
+		if _, err := GetUser(userchange.UserName); err == nil {
+			return &models.User{}, errors.New("username exists already")
+		}
 		user.UserName = userchange.UserName
 	}
-	if len(userchange.Networks) > 0 {
-		user.Networks = userchange.Networks
-	}
-	if len(userchange.Groups) > 0 {
-		user.Groups = userchange.Groups
-	}
 	if userchange.Password != "" {
+		if len(userchange.Password) < 5 {
+			return &models.User{}, errors.New("password requires min 5 characters")
+		}
 		// encrypt that password so we never see it again
 		hash, err := bcrypt.GenerateFromPassword([]byte(userchange.Password), 5)
 
@@ -285,16 +292,24 @@ func UpdateUser(userchange, user *models.User) (*models.User, error) {
 
 		user.Password = userchange.Password
 	}
-
-	if (userchange.IsAdmin != user.IsAdmin) && !user.IsAdmin {
-		user.IsAdmin = userchange.IsAdmin
+	if err := IsGroupsValid(userchange.UserGroups); err != nil {
+		return userchange, errors.New("invalid groups: " + err.Error())
 	}
-
+	if err := IsNetworkRolesValid(userchange.NetworkRoles); err != nil {
+		return userchange, errors.New("invalid network roles: " + err.Error())
+	}
+	// Reset Gw Access for service users
+	go UpdateUserGwAccess(*user, *userchange)
+	if userchange.PlatformRoleID != "" {
+		user.PlatformRoleID = userchange.PlatformRoleID
+	}
+	user.UserGroups = userchange.UserGroups
+	user.NetworkRoles = userchange.NetworkRoles
+	AddGlobalNetRolesToAdmins(*user)
 	err := ValidateUser(user)
 	if err != nil {
 		return &models.User{}, err
 	}
-
 	if err = database.DeleteRecord(database.USERS_TABLE_NAME, queryUser); err != nil {
 		return &models.User{}, err
 	}
@@ -312,12 +327,17 @@ func UpdateUser(userchange, user *models.User) (*models.User, error) {
 // ValidateUser - validates a user model
 func ValidateUser(user *models.User) error {
 
+	// check if role is valid
+	_, err := GetRole(user.PlatformRoleID)
+	if err != nil {
+		return errors.New("failed to fetch platform role " + user.PlatformRoleID.String())
+	}
 	v := validator.New()
 	_ = v.RegisterValidation("in_charset", func(fl validator.FieldLevel) bool {
 		isgood := user.NameInCharSet()
 		return isgood
 	})
-	err := v.Struct(user)
+	err = v.Struct(user)
 
 	if err != nil {
 		for _, e := range err.(validator.ValidationErrors) {
@@ -340,35 +360,34 @@ func DeleteUser(user string) (bool, error) {
 		return false, err
 	}
 
-	// == pro - remove user from all network user instances ==
-	currentNets, err := GetNetworks()
-	if err != nil {
-		if database.IsEmptyRecord(err) {
-			currentNets = []models.Network{}
-		} else {
-			return true, err
-		}
-	}
-
-	for i := range currentNets {
-		netID := currentNets[i].NetID
-		if err = pro.DeleteNetworkUser(netID, user); err != nil {
-			logger.Log(0, "failed to remove", user, "as network user from network", netID, err.Error())
-		}
-	}
-
 	return true, nil
 }
 
-// FetchAuthSecret - manages secrets for oauth
-func FetchAuthSecret(key string, secret string) (string, error) {
-	var record, err = database.FetchRecord(database.GENERATED_TABLE_NAME, key)
-	if err != nil {
-		if err = database.Insert(key, secret, database.GENERATED_TABLE_NAME); err != nil {
-			return "", err
-		} else {
-			return secret, nil
+func SetAuthSecret(secret string) error {
+	type valueHolder struct {
+		Value string `json:"value" bson:"value"`
+	}
+	record, err := FetchAuthSecret()
+	if err == nil {
+		v := valueHolder{}
+		json.Unmarshal([]byte(record), &v)
+		if v.Value != "" {
+			return nil
 		}
+	}
+	var b64NewValue = base64.StdEncoding.EncodeToString([]byte(secret))
+	newValueHolder := valueHolder{
+		Value: b64NewValue,
+	}
+	d, _ := json.Marshal(newValueHolder)
+	return database.Insert(auth_key, string(d), database.GENERATED_TABLE_NAME)
+}
+
+// FetchAuthSecret - manages secrets for oauth
+func FetchAuthSecret() (string, error) {
+	var record, err = database.FetchRecord(database.GENERATED_TABLE_NAME, auth_key)
+	if err != nil {
+		return "", err
 	}
 	return record, nil
 }
@@ -427,52 +446,4 @@ func IsStateValid(state string) (string, bool) {
 // delState - removes a state from cache/db
 func delState(state string) error {
 	return database.DeleteRecord(database.SSO_STATE_CACHE, state)
-}
-
-// PRO
-
-// AdjustGroupPermissions - adjusts a given user's network access based on group changes
-func AdjustGroupPermissions(user *models.ReturnUser) error {
-	networks, err := GetNetworks()
-	if err != nil {
-		return err
-	}
-	// UPDATE
-	// go through all networks and see if new group is in
-	// if access level of current user is greater (value) than network's default
-	// assign network's default
-	// DELETE
-	// if user not allowed on network a
-	for i := range networks {
-		AdjustNetworkUserPermissions(user, &networks[i])
-	}
-
-	return nil
-}
-
-// AdjustNetworkUserPermissions - adjusts a given user's network access based on group changes
-func AdjustNetworkUserPermissions(user *models.ReturnUser, network *models.Network) error {
-	networkUser, err := pro.GetNetworkUser(
-		network.NetID,
-		promodels.NetworkUserID(user.UserName),
-	)
-	if err == nil && network.ProSettings != nil {
-		if pro.IsUserAllowed(network, user.UserName, user.Groups) {
-			if networkUser.AccessLevel > network.ProSettings.DefaultAccessLevel {
-				networkUser.AccessLevel = network.ProSettings.DefaultAccessLevel
-			}
-			if networkUser.NodeLimit < network.ProSettings.DefaultUserNodeLimit {
-				networkUser.NodeLimit = network.ProSettings.DefaultUserNodeLimit
-			}
-			if networkUser.ClientLimit < network.ProSettings.DefaultUserClientLimit {
-				networkUser.ClientLimit = network.ProSettings.DefaultUserClientLimit
-			}
-		} else {
-			networkUser.AccessLevel = pro.NO_ACCESS
-			networkUser.NodeLimit = 0
-			networkUser.ClientLimit = 0
-		}
-		pro.UpdateNetworkUser(network.NetID, networkUser)
-	}
-	return err
 }

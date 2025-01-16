@@ -1,10 +1,15 @@
 package logic
 
 import (
+	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/gravitl/netmaker/logger"
+	"golang.org/x/exp/slog"
+
+	"github.com/gravitl/netmaker/models"
 )
 
 // == Constants ==
@@ -12,12 +17,15 @@ import (
 // How long to wait before sending telemetry to server (24 hours)
 const timer_hours_between_runs = 24
 
+// HookManagerCh - channel to add any new hooks
+var HookManagerCh = make(chan models.HookDetails, 3)
+
 // == Public ==
 
 // TimerCheckpoint - Checks if 24 hours has passed since telemetry was last sent. If so, sends telemetry data to posthog
 func TimerCheckpoint() error {
 	// get the telemetry record in the DB, which contains a timestamp
-	telRecord, err := fetchTelemetryRecord()
+	telRecord, err := FetchTelemetryRecord()
 	if err != nil {
 		return err
 	}
@@ -40,6 +48,38 @@ func AddHook(ifaceToAdd interface{}) {
 	timeHooks = append(timeHooks, ifaceToAdd)
 }
 
+// StartHookManager - listens on `HookManagerCh` to run any hook
+func StartHookManager(ctx context.Context, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for {
+		select {
+		case <-ctx.Done():
+			slog.Error("## Stopping Hook Manager")
+			return
+		case newhook := <-HookManagerCh:
+			wg.Add(1)
+			go addHookWithInterval(ctx, wg, newhook.Hook, newhook.Interval)
+		}
+	}
+}
+
+func addHookWithInterval(ctx context.Context, wg *sync.WaitGroup, hook func() error, interval time.Duration) {
+	defer wg.Done()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := hook(); err != nil {
+				slog.Error(err.Error())
+			}
+		}
+	}
+
+}
+
 // == private ==
 
 // timeHooks - functions to run once a day, functions must take no parameters
@@ -49,6 +89,7 @@ var timeHooks = []interface{}{
 }
 
 func loggerDump() error {
+	// TODO use slog?
 	logger.DumpFile(fmt.Sprintf("data/netmaker.log.%s", time.Now().Format(logger.TimeFormatDay)))
 	return nil
 }
@@ -57,7 +98,7 @@ func loggerDump() error {
 func runHooks() {
 	for _, hook := range timeHooks {
 		if err := hook.(func() error)(); err != nil {
-			logger.Log(1, "error occurred when running timer function:", err.Error())
+			slog.Error("error occurred when running timer function", "error", err.Error())
 		}
 	}
 }

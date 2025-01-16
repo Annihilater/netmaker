@@ -25,6 +25,8 @@ const (
 	DELETED_NODES_TABLE_NAME = "deletednodes"
 	// USERS_TABLE_NAME - users table
 	USERS_TABLE_NAME = "users"
+	// USER_PERMISSIONS_TABLE_NAME - user permissions table
+	USER_PERMISSIONS_TABLE_NAME = "user_permissions"
 	// CERTS_TABLE_NAME - certificates table
 	CERTS_TABLE_NAME = "certs"
 	// DNS_TABLE_NAME - dns table
@@ -45,6 +47,8 @@ const (
 	GENERATED_TABLE_NAME = "generated"
 	// NODE_ACLS_TABLE_NAME - stores the node ACL rules
 	NODE_ACLS_TABLE_NAME = "nodeacls"
+	// ACLS_TABLE_NAME - table for acls v2
+	ACLS_TABLE_NAME = "acls"
 	// SSO_STATE_CACHE - holds sso session information for OAuth2 sign-ins
 	SSO_STATE_CACHE = "ssostatecache"
 	// METRICS_TABLE_NAME - stores network metrics
@@ -61,7 +65,12 @@ const (
 	ENROLLMENT_KEYS_TABLE_NAME = "enrollmentkeys"
 	// HOST_ACTIONS_TABLE_NAME - table name for enrollmentkeys
 	HOST_ACTIONS_TABLE_NAME = "hostactions"
-
+	// PENDING_USERS_TABLE_NAME - table name for pending users
+	PENDING_USERS_TABLE_NAME = "pending_users"
+	// USER_INVITES - table for user invites
+	USER_INVITES_TABLE_NAME = "user_invites"
+	// TAG_TABLE_NAME - table for tags
+	TAG_TABLE_NAME = "tags"
 	// == ERROR CONSTS ==
 	// NO_RECORD - no singular result found
 	NO_RECORD = "no result found"
@@ -124,29 +133,34 @@ func InitializeDatabase() error {
 }
 
 func createTables() {
-	createTable(NETWORKS_TABLE_NAME)
-	createTable(NODES_TABLE_NAME)
-	createTable(CERTS_TABLE_NAME)
-	createTable(DELETED_NODES_TABLE_NAME)
-	createTable(USERS_TABLE_NAME)
-	createTable(DNS_TABLE_NAME)
-	createTable(EXT_CLIENT_TABLE_NAME)
-	createTable(PEERS_TABLE_NAME)
-	createTable(SERVERCONF_TABLE_NAME)
-	createTable(SERVER_UUID_TABLE_NAME)
-	createTable(GENERATED_TABLE_NAME)
-	createTable(NODE_ACLS_TABLE_NAME)
-	createTable(SSO_STATE_CACHE)
-	createTable(METRICS_TABLE_NAME)
-	createTable(NETWORK_USER_TABLE_NAME)
-	createTable(USER_GROUPS_TABLE_NAME)
-	createTable(CACHE_TABLE_NAME)
-	createTable(HOSTS_TABLE_NAME)
-	createTable(ENROLLMENT_KEYS_TABLE_NAME)
-	createTable(HOST_ACTIONS_TABLE_NAME)
+	CreateTable(NETWORKS_TABLE_NAME)
+	CreateTable(NODES_TABLE_NAME)
+	CreateTable(CERTS_TABLE_NAME)
+	CreateTable(DELETED_NODES_TABLE_NAME)
+	CreateTable(USERS_TABLE_NAME)
+	CreateTable(DNS_TABLE_NAME)
+	CreateTable(EXT_CLIENT_TABLE_NAME)
+	CreateTable(PEERS_TABLE_NAME)
+	CreateTable(SERVERCONF_TABLE_NAME)
+	CreateTable(SERVER_UUID_TABLE_NAME)
+	CreateTable(GENERATED_TABLE_NAME)
+	CreateTable(NODE_ACLS_TABLE_NAME)
+	CreateTable(SSO_STATE_CACHE)
+	CreateTable(METRICS_TABLE_NAME)
+	CreateTable(NETWORK_USER_TABLE_NAME)
+	CreateTable(USER_GROUPS_TABLE_NAME)
+	CreateTable(CACHE_TABLE_NAME)
+	CreateTable(HOSTS_TABLE_NAME)
+	CreateTable(ENROLLMENT_KEYS_TABLE_NAME)
+	CreateTable(HOST_ACTIONS_TABLE_NAME)
+	CreateTable(PENDING_USERS_TABLE_NAME)
+	CreateTable(USER_PERMISSIONS_TABLE_NAME)
+	CreateTable(USER_INVITES_TABLE_NAME)
+	CreateTable(TAG_TABLE_NAME)
+	CreateTable(ACLS_TABLE_NAME)
 }
 
-func createTable(tableName string) error {
+func CreateTable(tableName string) error {
 	return getCurrentDB()[CREATE_TABLE].(func(string) error)(tableName)
 }
 
@@ -194,7 +208,7 @@ func DeleteAllRecords(tableName string) error {
 	if err != nil {
 		return err
 	}
-	err = createTable(tableName)
+	err = CreateTable(tableName)
 	if err != nil {
 		return err
 	}

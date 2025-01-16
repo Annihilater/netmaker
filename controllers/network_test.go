@@ -25,12 +25,10 @@ var netHost models.Host
 func TestMain(m *testing.M) {
 	database.InitializeDatabase()
 	defer database.CloseDB()
-	logic.CreateAdmin(&models.User{
-		UserName: "admin",
-		Password: "password",
-		IsAdmin:  true,
-		Networks: []string{},
-		Groups:   []string{},
+	logic.CreateSuperAdmin(&models.User{
+		UserName:       "admin",
+		Password:       "password",
+		PlatformRoleID: models.SuperAdminRole,
 	})
 	peerUpdate := make(chan *models.Node)
 	go logic.ManageZombies(context.Background(), peerUpdate)
@@ -48,8 +46,8 @@ func TestCreateNetwork(t *testing.T) {
 	deleteAllNetworks()
 
 	var network models.Network
-	network.NetID = "skynet"
-	network.AddressRange = "10.0.0.1/24"
+	network.NetID = "skynet1"
+	network.AddressRange = "10.10.0.1/24"
 	// if tests break - check here (removed displayname)
 	//network.DisplayName = "mynetwork"
 
@@ -80,7 +78,7 @@ func TestDeleteNetwork(t *testing.T) {
 		err := logic.DeleteNetwork("skynet")
 		assert.Nil(t, err)
 	})
-	t.Run("NonExistantNetwork", func(t *testing.T) {
+	t.Run("NonExistentNetwork", func(t *testing.T) {
 		err := logic.DeleteNetwork("skynet")
 		assert.Nil(t, err)
 	})
@@ -91,27 +89,16 @@ func TestSecurityCheck(t *testing.T) {
 
 	os.Setenv("MASTER_KEY", "secretkey")
 	t.Run("NoNetwork", func(t *testing.T) {
-		networks, username, err := logic.UserPermissions(false, "", "Bearer secretkey")
+		username, err := logic.UserPermissions(false, "Bearer secretkey")
 		assert.Nil(t, err)
-		t.Log(networks, username)
+		t.Log(username)
 	})
-	t.Run("WithNetwork", func(t *testing.T) {
-		networks, username, err := logic.UserPermissions(false, "skynet", "Bearer secretkey")
-		assert.Nil(t, err)
-		t.Log(networks, username)
-	})
-	t.Run("BadNet", func(t *testing.T) {
-		t.Skip()
-		networks, username, err := logic.UserPermissions(false, "badnet", "Bearer secretkey")
-		assert.NotNil(t, err)
-		t.Log(err)
-		t.Log(networks, username)
-	})
+
 	t.Run("BadToken", func(t *testing.T) {
-		networks, username, err := logic.UserPermissions(false, "skynet", "Bearer badkey")
+		username, err := logic.UserPermissions(false, "Bearer badkey")
 		assert.NotNil(t, err)
 		t.Log(err)
-		t.Log(networks, username)
+		t.Log(username)
 	})
 }
 
@@ -151,7 +138,7 @@ func TestValidateNetwork(t *testing.T) {
 		{
 			testname: "NetIDTooLong",
 			network: models.Network{
-				NetID: "LongNetIDName",
+				NetID: "LongNetIDNameForMaxCharactersTest",
 			},
 			errMessage: "Field validation for 'NetID' failed on the 'max' tag",
 		},

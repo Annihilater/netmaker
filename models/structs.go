@@ -1,7 +1,9 @@
 package models
 
 import (
+	"net"
 	"strings"
+	"time"
 
 	jwt "github.com/golang-jwt/jwt/v4"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
@@ -14,12 +16,6 @@ const (
 	PLACEHOLDER_TOKEN_TEXT = "ACCESS_TOKEN"
 )
 
-// CustomExtClient - struct for CustomExtClient params
-type CustomExtClient struct {
-	ClientID  string `json:"clientid"`
-	PublicKey string `json:"publickey,omitempty"`
-}
-
 // AuthParams - struct for auth params
 type AuthParams struct {
 	MacAddress string `json:"macaddress"`
@@ -27,36 +23,41 @@ type AuthParams struct {
 	Password   string `json:"password"`
 }
 
-// User struct - struct for Users
-type User struct {
-	UserName string   `json:"username" bson:"username" validate:"min=3,max=40,in_charset|email"`
-	Password string   `json:"password" bson:"password" validate:"required,min=5"`
-	Networks []string `json:"networks" bson:"networks"`
-	IsAdmin  bool     `json:"isadmin" bson:"isadmin"`
-	Groups   []string `json:"groups" bson:"groups" yaml:"groups"`
+// IngressGwUsers - struct to hold users on a ingress gw
+type IngressGwUsers struct {
+	NodeID  string       `json:"node_id"`
+	Network string       `json:"network"`
+	Users   []ReturnUser `json:"users"`
 }
 
-// ReturnUser - return user struct
-type ReturnUser struct {
-	UserName string   `json:"username" bson:"username"`
-	Networks []string `json:"networks" bson:"networks"`
-	IsAdmin  bool     `json:"isadmin" bson:"isadmin"`
-	Groups   []string `json:"groups" bson:"groups"`
+// UserRemoteGws - struct to hold user's remote gws
+type UserRemoteGws struct {
+	GwID              string    `json:"remote_access_gw_id"`
+	GWName            string    `json:"gw_name"`
+	Network           string    `json:"network"`
+	Connected         bool      `json:"connected"`
+	IsInternetGateway bool      `json:"is_internet_gateway"`
+	GwClient          ExtClient `json:"gw_client"`
+	GwPeerPublicKey   string    `json:"gw_peer_public_key"`
+	GwListenPort      int       `json:"gw_listen_port"`
+	Metadata          string    `json:"metadata"`
+	AllowedEndpoints  []string  `json:"allowed_endpoints"`
+	NetworkAddresses  []string  `json:"network_addresses"`
 }
 
-// UserAuthParams - user auth params struct
-type UserAuthParams struct {
-	UserName string `json:"username"`
-	Password string `json:"password"`
+// UserRAGs - struct for user access gws
+type UserRAGs struct {
+	GwID              string `json:"remote_access_gw_id"`
+	GWName            string `json:"gw_name"`
+	Network           string `json:"network"`
+	Connected         bool   `json:"connected"`
+	IsInternetGateway bool   `json:"is_internet_gateway"`
+	Metadata          string `json:"metadata"`
 }
 
-// UserClaims - user claims struct
-type UserClaims struct {
-	IsAdmin  bool
-	UserName string
-	Networks []string
-	Groups   []string
-	jwt.RegisteredClaims
+// UserRemoteGwsReq - struct to hold user remote acccess gws req
+type UserRemoteGwsReq struct {
+	RemoteAccessClientID string `json:"remote_access_clientid"`
 }
 
 // SuccessfulUserLoginResponse - successlogin struct
@@ -159,15 +160,29 @@ type EgressGatewayRequest struct {
 
 // RelayRequest - relay request struct
 type RelayRequest struct {
-	NodeID     string   `json:"nodeid" bson:"nodeid"`
-	NetID      string   `json:"netid" bson:"netid"`
-	RelayAddrs []string `json:"relayaddrs" bson:"relayaddrs"`
+	NodeID       string   `json:"nodeid"`
+	NetID        string   `json:"netid"`
+	RelayedNodes []string `json:"relayaddrs"`
 }
 
 // HostRelayRequest - struct for host relay creation
 type HostRelayRequest struct {
 	HostID       string   `json:"host_id"`
 	RelayedHosts []string `json:"relayed_hosts"`
+}
+
+// IngressRequest - ingress request struct
+type IngressRequest struct {
+	ExtclientDNS        string `json:"extclientdns"`
+	IsInternetGateway   bool   `json:"is_internet_gw"`
+	Metadata            string `json:"metadata"`
+	PersistentKeepalive int32  `json:"persistentkeepalive"`
+	MTU                 int32  `json:"mtu"`
+}
+
+// InetNodeReq - exit node request struct
+type InetNodeReq struct {
+	InetNodeClientIDs []string `json:"inet_node_client_ids"`
 }
 
 // ServerUpdateData - contains data to configure server
@@ -181,7 +196,7 @@ type ServerUpdateData struct {
 // also contains assymetrical encryption pub/priv keys for any server traffic
 type Telemetry struct {
 	UUID           string `json:"uuid" bson:"uuid"`
-	LastSend       int64  `json:"lastsend" bson:"lastsend"`
+	LastSend       int64  `json:"lastsend" bson:"lastsend" swaggertype:"primitive,integer" format:"int64"`
 	TrafficKeyPriv []byte `json:"traffickeypriv" bson:"traffickeypriv"`
 	TrafficKeyPub  []byte `json:"traffickeypub" bson:"traffickeypub"`
 }
@@ -200,10 +215,21 @@ type TrafficKeys struct {
 
 // HostPull - response of a host's pull
 type HostPull struct {
-	Host         Host                 `json:"host" yaml:"host"`
-	Peers        []wgtypes.PeerConfig `json:"peers" yaml:"peers"`
-	ServerConfig ServerConfig         `json:"server_config" yaml:"server_config"`
-	PeerIDs      PeerMap              `json:"peer_ids,omitempty" yaml:"peer_ids,omitempty"`
+	Host              Host                  `json:"host" yaml:"host"`
+	Nodes             []Node                `json:"nodes" yaml:"nodes"`
+	Peers             []wgtypes.PeerConfig  `json:"peers" yaml:"peers"`
+	ServerConfig      ServerConfig          `json:"server_config" yaml:"server_config"`
+	PeerIDs           PeerMap               `json:"peer_ids,omitempty" yaml:"peer_ids,omitempty"`
+	HostNetworkInfo   HostInfoMap           `json:"host_network_info,omitempty"  yaml:"host_network_info,omitempty"`
+	EgressRoutes      []EgressNetworkRoutes `json:"egress_network_routes"`
+	FwUpdate          FwUpdate              `json:"fw_update"`
+	ChangeDefaultGw   bool                  `json:"change_default_gw"`
+	DefaultGwIp       net.IP                `json:"default_gw_ip"`
+	IsInternetGw      bool                  `json:"is_inet_gw"`
+	EndpointDetection bool                  `json:"endpoint_detection"`
+}
+
+type DefaultGwInfo struct {
 }
 
 // NodeGet - struct for a single node get response
@@ -226,23 +252,24 @@ type NodeJoinResponse struct {
 
 // ServerConfig - struct for dealing with the server information for a netclient
 type ServerConfig struct {
-	CoreDNSAddr string       `yaml:"corednsaddr"`
-	API         string       `yaml:"api"`
-	APIPort     string       `yaml:"apiport"`
-	DNSMode     string       `yaml:"dnsmode"`
-	Version     string       `yaml:"version"`
-	MQPort      string       `yaml:"mqport"`
-	MQUserName  string       `yaml:"mq_username"`
-	MQPassword  string       `yaml:"mq_password"`
-	Server      string       `yaml:"server"`
-	Broker      string       `yaml:"broker"`
-	Is_EE       bool         `yaml:"isee"`
-	StunPort    int          `yaml:"stun_port"`
-	StunList    []StunServer `yaml:"stun_list"`
-	TrafficKey  []byte       `yaml:"traffickey"`
-	TurnDomain  string       `yaml:"turn_domain"`
-	TurnPort    int          `yaml:"turn_port"`
-	UseTurn     bool         `yaml:"use_turn"`
+	CoreDNSAddr    string `yaml:"corednsaddr"`
+	API            string `yaml:"api"`
+	APIPort        string `yaml:"apiport"`
+	DNSMode        string `yaml:"dnsmode"`
+	Version        string `yaml:"version"`
+	MQPort         string `yaml:"mqport"`
+	MQUserName     string `yaml:"mq_username"`
+	MQPassword     string `yaml:"mq_password"`
+	BrokerType     string `yaml:"broker_type"`
+	Server         string `yaml:"server"`
+	Broker         string `yaml:"broker"`
+	IsPro          bool   `yaml:"isee" json:"Is_EE"`
+	TrafficKey     []byte `yaml:"traffickey"`
+	MetricInterval string `yaml:"metric_interval"`
+	ManageDNS      bool   `yaml:"manage_dns"`
+	Stun           bool   `yaml:"stun"`
+	StunServers    string `yaml:"stun_servers"`
+	DefaultDomain  string `yaml:"default_domain"`
 }
 
 // User.NameInCharset - returns if name is in charset below or not
@@ -268,8 +295,77 @@ type JoinData struct {
 	Key  string `json:"key" yaml:"key"`
 }
 
-// StunServer - struct to hold data required for using stun server
-type StunServer struct {
-	Domain string `json:"domain" yaml:"domain"`
-	Port   int    `json:"port" yaml:"port"`
+// HookDetails - struct to hold hook info
+type HookDetails struct {
+	Hook     func() error
+	Interval time.Duration
+}
+
+// LicenseLimits - struct license limits
+type LicenseLimits struct {
+	Servers  int `json:"servers"`
+	Users    int `json:"users"`
+	Hosts    int `json:"hosts"`
+	Clients  int `json:"clients"`
+	Networks int `json:"networks"`
+}
+
+type SignInReqDto struct {
+	FormFields FormFields `json:"formFields"`
+}
+
+type FormField struct {
+	Id    string `json:"id"`
+	Value any    `json:"value"`
+}
+
+type FormFields []FormField
+
+type SignInResDto struct {
+	Status string `json:"status"`
+	User   User   `json:"user"`
+}
+
+type TenantLoginResDto struct {
+	Code     int    `json:"code"`
+	Message  string `json:"message"`
+	Response struct {
+		UserName  string `json:"UserName"`
+		AuthToken string `json:"AuthToken"`
+	} `json:"response"`
+}
+
+type SsoLoginReqDto struct {
+	OauthProvider string `json:"oauthprovider"`
+}
+
+type SsoLoginResDto struct {
+	User      string `json:"UserName"`
+	AuthToken string `json:"AuthToken"`
+}
+
+type SsoLoginData struct {
+	Expiration     time.Time `json:"expiration"`
+	OauthProvider  string    `json:"oauthprovider,omitempty"`
+	OauthCode      string    `json:"oauthcode,omitempty"`
+	Username       string    `json:"username,omitempty"`
+	AmbAccessToken string    `json:"ambaccesstoken,omitempty"`
+}
+
+type LoginReqDto struct {
+	Email    string `json:"email"`
+	TenantID string `json:"tenant_id"`
+}
+
+const (
+	ResHeaderKeyStAccessToken = "St-Access-Token"
+)
+
+type GetClientConfReqDto struct {
+	PreferredIp string `json:"preferred_ip"`
+}
+
+type RsrcURLInfo struct {
+	Method string
+	Path   string
 }

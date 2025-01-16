@@ -1,171 +1,86 @@
 package logic
 
 import (
-	"encoding/json"
 	"net/http"
 	"strings"
 
 	"github.com/gorilla/mux"
-	"github.com/gravitl/netmaker/database"
-	"github.com/gravitl/netmaker/logic/pro"
 	"github.com/gravitl/netmaker/models"
-	"github.com/gravitl/netmaker/models/promodels"
 	"github.com/gravitl/netmaker/servercfg"
 )
 
 const (
-	// ALL_NETWORK_ACCESS - represents all networks
-	ALL_NETWORK_ACCESS = "THIS_USER_HAS_ALL"
-
-	master_uname     = "masteradministrator"
+	MasterUser       = "masteradministrator"
+	Forbidden_Msg    = "forbidden"
+	Forbidden_Err    = models.Error(Forbidden_Msg)
 	Unauthorized_Msg = "unauthorized"
 	Unauthorized_Err = models.Error(Unauthorized_Msg)
 )
+
+var NetworkPermissionsCheck = func(username string, r *http.Request) error { return nil }
+var GlobalPermissionsCheck = func(username string, r *http.Request) error { return nil }
 
 // SecurityCheck - Check if user has appropriate permissions
 func SecurityCheck(reqAdmin bool, next http.Handler) http.HandlerFunc {
 
 	return func(w http.ResponseWriter, r *http.Request) {
-		var errorResponse = models.ErrorResponse{
-			Code: http.StatusUnauthorized, Message: Unauthorized_Msg,
-		}
-
-		var params = mux.Vars(r)
+		r.Header.Set("ismaster", "no")
+		isGlobalAccesss := r.Header.Get("IS_GLOBAL_ACCESS") == "yes"
 		bearerToken := r.Header.Get("Authorization")
-		// to have a custom DNS service adding entries
-		// we should refactor this, but is for the special case of an external service to query the DNS api
-		if strings.Contains(r.RequestURI, "/dns") && strings.ToUpper(r.Method) == "GET" && authenticateDNSToken(bearerToken) {
-			// do dns stuff
-			r.Header.Set("user", "nameserver")
-			networks, _ := json.Marshal([]string{ALL_NETWORK_ACCESS})
-			r.Header.Set("networks", string(networks))
-			next.ServeHTTP(w, r)
+		username, err := GetUserNameFromToken(bearerToken)
+		if err != nil {
+			ReturnErrorResponse(w, r, FormatError(err, "unauthorized"))
 			return
 		}
-		var networkName = params["networkname"]
-		if len(networkName) == 0 {
-			networkName = params["network"]
+		// detect masteradmin
+		if username == MasterUser {
+			r.Header.Set("ismaster", "yes")
+		} else {
+			if isGlobalAccesss {
+				err = GlobalPermissionsCheck(username, r)
+			} else {
+				err = NetworkPermissionsCheck(username, r)
+			}
 		}
-		networks, username, err := UserPermissions(reqAdmin, networkName, bearerToken)
+		w.Header().Set("TARGET_RSRC", r.Header.Get("TARGET_RSRC"))
+		w.Header().Set("TARGET_RSRC_ID", r.Header.Get("TARGET_RSRC_ID"))
+		w.Header().Set("RSRC_TYPE", r.Header.Get("RSRC_TYPE"))
+		w.Header().Set("IS_GLOBAL_ACCESS", r.Header.Get("IS_GLOBAL_ACCESS"))
+		w.Header().Set("Access-Control-Allow-Origin", "*")
 		if err != nil {
-			ReturnErrorResponse(w, r, errorResponse)
-			return
-		}
-		networksJson, err := json.Marshal(&networks)
-		if err != nil {
-			ReturnErrorResponse(w, r, errorResponse)
+			w.Header().Set("ACCESS_PERM", err.Error())
+			ReturnErrorResponse(w, r, FormatError(err, "forbidden"))
 			return
 		}
 		r.Header.Set("user", username)
-		r.Header.Set("networks", string(networksJson))
-		next.ServeHTTP(w, r)
-	}
-}
-
-// NetUserSecurityCheck - Check if network user has appropriate permissions
-func NetUserSecurityCheck(isNodes, isClients bool, next http.Handler) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		var errorResponse = models.ErrorResponse{
-			Code: http.StatusUnauthorized, Message: "unauthorized",
-		}
-		r.Header.Set("ismaster", "no")
-
-		var params = mux.Vars(r)
-		var netUserName = params["networkuser"]
-		var network = params["network"]
-
-		bearerToken := r.Header.Get("Authorization")
-
-		var tokenSplit = strings.Split(bearerToken, " ")
-		var authToken = ""
-
-		if len(tokenSplit) < 2 {
-			ReturnErrorResponse(w, r, errorResponse)
-			return
-		} else {
-			authToken = tokenSplit[1]
-		}
-
-		isMasterAuthenticated := authenticateMaster(authToken)
-		if isMasterAuthenticated {
-			r.Header.Set("user", "master token user")
-			r.Header.Set("ismaster", "yes")
-			next.ServeHTTP(w, r)
-			return
-		}
-
-		userName, _, isadmin, err := VerifyUserToken(authToken)
-		if err != nil {
-			ReturnErrorResponse(w, r, errorResponse)
-			return
-		}
-		r.Header.Set("user", userName)
-
-		if isadmin {
-			next.ServeHTTP(w, r)
-			return
-		}
-
-		if isNodes || isClients {
-			necessaryAccess := pro.NET_ADMIN
-			if isClients {
-				necessaryAccess = pro.CLIENT_ACCESS
-			}
-			if isNodes {
-				necessaryAccess = pro.NODE_ACCESS
-			}
-			u, err := pro.GetNetworkUser(network, promodels.NetworkUserID(userName))
-			if err != nil {
-				ReturnErrorResponse(w, r, errorResponse)
-				return
-			}
-			if u.AccessLevel > necessaryAccess {
-				ReturnErrorResponse(w, r, errorResponse)
-				return
-			}
-		} else if netUserName != userName {
-			ReturnErrorResponse(w, r, errorResponse)
-			return
-		}
-
 		next.ServeHTTP(w, r)
 	}
 }
 
 // UserPermissions - checks token stuff
-func UserPermissions(reqAdmin bool, netname string, token string) ([]string, string, error) {
+func UserPermissions(reqAdmin bool, token string) (string, error) {
 	var tokenSplit = strings.Split(token, " ")
 	var authToken = ""
-	userNetworks := []string{}
 
 	if len(tokenSplit) < 2 {
-		return userNetworks, "", Unauthorized_Err
+		return "", Unauthorized_Err
 	} else {
 		authToken = tokenSplit[1]
 	}
 	//all endpoints here require master so not as complicated
 	if authenticateMaster(authToken) {
-		return []string{ALL_NETWORK_ACCESS}, master_uname, nil
+		// TODO log in as an actual admin user
+		return MasterUser, nil
 	}
-	username, networks, isadmin, err := VerifyUserToken(authToken)
+	username, issuperadmin, isadmin, err := VerifyUserToken(authToken)
 	if err != nil {
-		return nil, username, Unauthorized_Err
+		return username, Unauthorized_Err
 	}
-	if !isadmin && reqAdmin {
-		return nil, username, Unauthorized_Err
+	if reqAdmin && !(issuperadmin || isadmin) {
+		return username, Forbidden_Err
 	}
-	userNetworks = networks
-	if isadmin {
-		return []string{ALL_NETWORK_ACCESS}, username, nil
-	}
-	// check network admin access
-	if len(netname) > 0 && (len(userNetworks) == 0 || !authenticateNetworkUser(netname, userNetworks)) {
-		return nil, username, Unauthorized_Err
-	}
-	if isEE && len(netname) > 0 && !pro.IsUserNetAdmin(netname, username) {
-		return nil, "", Unauthorized_Err
-	}
-	return userNetworks, username, nil
+
+	return username, nil
 }
 
 // Consider a more secure way of setting master key
@@ -173,30 +88,16 @@ func authenticateMaster(tokenString string) bool {
 	return tokenString == servercfg.GetMasterKey() && servercfg.GetMasterKey() != ""
 }
 
-func authenticateNetworkUser(network string, userNetworks []string) bool {
-	networkexists, err := NetworkExists(network)
-	if (err != nil && !database.IsEmptyRecord(err)) || !networkexists {
-		return false
-	}
-	return StringSliceContains(userNetworks, network)
-}
-
-// Consider a more secure way of setting master key
-func authenticateDNSToken(tokenString string) bool {
-	tokens := strings.Split(tokenString, " ")
-	if len(tokens) < 2 {
-		return false
-	}
-	return len(servercfg.GetDNSKey()) > 0 && tokens[1] == servercfg.GetDNSKey()
-}
-
 func ContinueIfUserMatch(next http.Handler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var errorResponse = models.ErrorResponse{
-			Code: http.StatusUnauthorized, Message: Unauthorized_Msg,
+			Code: http.StatusForbidden, Message: Forbidden_Msg,
 		}
 		var params = mux.Vars(r)
 		var requestedUser = params["username"]
+		if requestedUser == "" {
+			requestedUser = r.URL.Query().Get("username")
+		}
 		if requestedUser != r.Header.Get("user") {
 			ReturnErrorResponse(w, r, errorResponse)
 			return

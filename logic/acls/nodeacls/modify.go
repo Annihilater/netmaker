@@ -3,6 +3,7 @@ package nodeacls
 import (
 	"github.com/gravitl/netmaker/database"
 	"github.com/gravitl/netmaker/logic/acls"
+	"github.com/gravitl/netmaker/servercfg"
 )
 
 // CreateNodeACL - inserts or updates a node ACL on given network and adds to state
@@ -21,12 +22,17 @@ func CreateNodeACL(networkID NetworkID, nodeID NodeID, defaultVal byte) (acls.AC
 			return nil, err
 		}
 	}
+	acls.AclMutex.Lock()
 	var newNodeACL = make(acls.ACL)
 	for existingNodeID := range currentNetworkACL {
+		if currentNetworkACL[existingNodeID] == nil {
+			currentNetworkACL[existingNodeID] = make(acls.ACL)
+		}
 		currentNetworkACL[existingNodeID][acls.AclID(nodeID)] = defaultVal // set the old nodes to default value for new node
 		newNodeACL[existingNodeID] = defaultVal                            // set the old nodes in new node ACL to default value
 	}
-	currentNetworkACL[acls.AclID(nodeID)] = newNodeACL                        // append the new node's ACL
+	currentNetworkACL[acls.AclID(nodeID)] = newNodeACL // append the new node's ACL
+	acls.AclMutex.Unlock()
 	retNetworkACL, err := currentNetworkACL.Save(acls.ContainerID(networkID)) // insert into db
 	if err != nil {
 		return nil, err
@@ -62,7 +68,9 @@ func UpdateNodeACL(networkID NetworkID, nodeID NodeID, acl acls.ACL) (acls.ACL, 
 	if err != nil {
 		return nil, err
 	}
+	acls.AclMutex.Lock()
 	currentNetworkACL[acls.AclID(nodeID)] = acl
+	acls.AclMutex.Unlock()
 	return currentNetworkACL[acls.AclID(nodeID)].Save(acls.ContainerID(networkID), acls.AclID(nodeID))
 }
 
@@ -83,5 +91,12 @@ func RemoveNodeACL(networkID NetworkID, nodeID NodeID) (acls.ACLContainer, error
 
 // DeleteACLContainer - removes an ACLContainer state from db
 func DeleteACLContainer(network NetworkID) error {
-	return database.DeleteRecord(database.NODE_ACLS_TABLE_NAME, string(network))
+	err := database.DeleteRecord(database.NODE_ACLS_TABLE_NAME, string(network))
+	if err != nil {
+		return err
+	}
+	if servercfg.CacheEnabled() {
+		acls.DeleteAclFromCache(acls.ContainerID(network))
+	}
+	return nil
 }

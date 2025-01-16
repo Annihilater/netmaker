@@ -4,9 +4,10 @@
 package main
 
 import (
-	"github.com/gravitl/netmaker/ee"
+	"github.com/gravitl/netmaker/pro"
+	_ "go.uber.org/automaxprocs"
 )
 
 func init() {
-	ee.InitEE()
+	pro.InitPro()
 }

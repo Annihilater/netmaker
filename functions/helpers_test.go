@@ -18,20 +18,17 @@ var (
 		NetID: "not-a-network",
 	}
 	testExternalClient = &models.ExtClient{
-		ClientID:    "testExtClient",
-		Description: "ext client for testing",
+		ClientID: "testExtClient",
 	}
 )
 
 func TestMain(m *testing.M) {
 	database.InitializeDatabase()
 	defer database.CloseDB()
-	logic.CreateAdmin(&models.User{
-		UserName: "admin",
-		Password: "password",
-		IsAdmin:  true,
-		Networks: []string{},
-		Groups:   []string{},
+	logic.CreateSuperAdmin(&models.User{
+		UserName:       "superadmin",
+		Password:       "password",
+		PlatformRoleID: models.SuperAdminRole,
 	})
 	peerUpdate := make(chan *models.Node)
 	go logic.ManageZombies(context.Background(), peerUpdate)

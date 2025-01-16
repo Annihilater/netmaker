@@ -1,27 +1,21 @@
-# Netmaker v0.19.0
+# Netmaker v0.30.0
 
-## whats new
-- TURN
-- dependency updates
-- internet gateways (0.0.0.0/0) for egress
-- deprecated editing of network parameters
-- allow extra ips for extclient (not enabled in UI)
-    
-## whats fixed
-- unbiased random string
-- get traffic keys on pull
-- CI updates
-- install/update script updates
-- firewall checks
--  
-- 
+## Whats New ✨
+- Advanced ACL Rules - port, protocol and traffic direction
+- Reduced Firewall Requirements To One Single Port (443 udp/tcp)
+- Option to Turn off STUN or specify custom stun servers
+- Improved Connectivity Status Indicator with real-time troubleshooting help.
 
-## known issues
-- Caddy does not handle netmaker exporter well for EE
-- Migration causes a listen port of 0 for some upgraded hosts
-- Docker clients can not re-join after deletion
-- Innacurate Ext Client Metrics 
-- Issue with Mac + IPv6 addressing
-- Nodes on same local network may not always connect
-- List populates egress ranges twice
-- If you do NOT set STUN_LIST on server, it could lead to strange behavior on client
+## What's Fixed/Improved 🛠
+- Metrics Data
+- Optimised MQ message size
+- FailOver Stability Fixes
+- Scalability Fixes
+- Duplicate Node IP check on update
+
+## Known Issues 🐞
+
+- IPv6 DNS Entries Are Not Working.
+- Stale Peer On The Interface, When Forced Removed From Multiple Networks At Once.
+- WireGuard DNS issue on most flavours of Ubuntu 24.04 and some other newer Linux distributions. The issue is affecting the Remote Access Client (RAC) and the plain WireGuard external clients. Workaround can be found here https://help.netmaker.io/en/articles/9612016-extclient-rac-dns-issue-on-ubuntu-24-04.
+

@@ -2,22 +2,25 @@ package logic
 
 import (
 	"crypto/md5"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
-	"net/http"
 	"sort"
-	"strconv"
+	"sync"
 
-	"github.com/devilcove/httpclient"
 	"github.com/google/uuid"
+	"golang.org/x/crypto/bcrypt"
+	"golang.org/x/exp/slog"
+
 	"github.com/gravitl/netmaker/database"
 	"github.com/gravitl/netmaker/logger"
 	"github.com/gravitl/netmaker/models"
 	"github.com/gravitl/netmaker/servercfg"
-	"golang.org/x/crypto/bcrypt"
+)
+
+var (
+	hostCacheMutex = &sync.RWMutex{}
+	hostsCacheMap  = make(map[string]models.Host)
 )
 
 var (
@@ -27,6 +30,47 @@ var (
 	ErrInvalidHostID error = errors.New("invalid host id")
 )
 
+func getHostsFromCache() (hosts []models.Host) {
+	hostCacheMutex.RLock()
+	for _, host := range hostsCacheMap {
+		hosts = append(hosts, host)
+	}
+	hostCacheMutex.RUnlock()
+	return
+}
+
+func getHostsMapFromCache() (hostsMap map[string]models.Host) {
+	hostCacheMutex.RLock()
+	hostsMap = hostsCacheMap
+	hostCacheMutex.RUnlock()
+	return
+}
+
+func getHostFromCache(hostID string) (host models.Host, ok bool) {
+	hostCacheMutex.RLock()
+	host, ok = hostsCacheMap[hostID]
+	hostCacheMutex.RUnlock()
+	return
+}
+
+func storeHostInCache(h models.Host) {
+	hostCacheMutex.Lock()
+	hostsCacheMap[h.ID.String()] = h
+	hostCacheMutex.Unlock()
+}
+
+func deleteHostFromCache(hostID string) {
+	hostCacheMutex.Lock()
+	delete(hostsCacheMap, hostID)
+	hostCacheMutex.Unlock()
+}
+
+func loadHostsIntoCache(hMap map[string]models.Host) {
+	hostCacheMutex.Lock()
+	hostsCacheMap = hMap
+	hostCacheMutex.Unlock()
+}
+
 const (
 	maxPort = 1<<16 - 1
 	minPort = 1025
@@ -34,17 +78,32 @@ const (
 
 // GetAllHosts - returns all hosts in flat list or error
 func GetAllHosts() ([]models.Host, error) {
-	currHostMap, err := GetHostsMap()
-	if err != nil {
+	var currHosts []models.Host
+	if servercfg.CacheEnabled() {
+		currHosts := getHostsFromCache()
+		if len(currHosts) != 0 {
+			return currHosts, nil
+		}
+	}
+	records, err := database.FetchRecords(database.HOSTS_TABLE_NAME)
+	if err != nil && !database.IsEmptyRecord(err) {
 		return nil, err
 	}
-	var currentHosts = []models.Host{}
-	for k := range currHostMap {
-		var h = *currHostMap[k]
-		currentHosts = append(currentHosts, h)
+	currHostsMap := make(map[string]models.Host)
+	if servercfg.CacheEnabled() {
+		defer loadHostsIntoCache(currHostsMap)
+	}
+	for k := range records {
+		var h models.Host
+		err = json.Unmarshal([]byte(records[k]), &h)
+		if err != nil {
+			return nil, err
+		}
+		currHosts = append(currHosts, h)
+		currHostsMap[h.ID.String()] = h
 	}
 
-	return currentHosts, nil
+	return currHosts, nil
 }
 
 // GetAllHostsAPI - get's all the hosts in an API usable format
@@ -58,19 +117,28 @@ func GetAllHostsAPI(hosts []models.Host) []models.ApiHost {
 }
 
 // GetHostsMap - gets all the current hosts on machine in a map
-func GetHostsMap() (map[string]*models.Host, error) {
+func GetHostsMap() (map[string]models.Host, error) {
+	if servercfg.CacheEnabled() {
+		hostsMap := getHostsMapFromCache()
+		if len(hostsMap) != 0 {
+			return hostsMap, nil
+		}
+	}
 	records, err := database.FetchRecords(database.HOSTS_TABLE_NAME)
 	if err != nil && !database.IsEmptyRecord(err) {
 		return nil, err
 	}
-	currHostMap := make(map[string]*models.Host)
+	currHostMap := make(map[string]models.Host)
+	if servercfg.CacheEnabled() {
+		defer loadHostsIntoCache(currHostMap)
+	}
 	for k := range records {
 		var h models.Host
 		err = json.Unmarshal([]byte(records[k]), &h)
 		if err != nil {
 			return nil, err
 		}
-		currHostMap[h.ID.String()] = &h
+		currHostMap[h.ID.String()] = h
 	}
 
 	return currHostMap, nil
@@ -78,6 +146,11 @@ func GetHostsMap() (map[string]*models.Host, error) {
 
 // GetHost - gets a host from db given id
 func GetHost(hostid string) (*models.Host, error) {
+	if servercfg.CacheEnabled() {
+		if host, ok := getHostFromCache(hostid); ok {
+			return &host, nil
+		}
+	}
 	record, err := database.FetchRecord(database.HOSTS_TABLE_NAME, hostid)
 	if err != nil {
 		return nil, err
@@ -87,21 +160,39 @@ func GetHost(hostid string) (*models.Host, error) {
 	if err = json.Unmarshal([]byte(record), &h); err != nil {
 		return nil, err
 	}
+	if servercfg.CacheEnabled() {
+		storeHostInCache(h)
+	}
 
 	return &h, nil
 }
 
+// GetHostByPubKey - gets a host from db given pubkey
+func GetHostByPubKey(hostPubKey string) (*models.Host, error) {
+	hosts, err := GetAllHosts()
+	if err != nil {
+		return nil, err
+	}
+	for _, host := range hosts {
+		if host.PublicKey.String() == hostPubKey {
+			return &host, nil
+		}
+	}
+	return nil, errors.New("host not found")
+}
+
 // CreateHost - creates a host if not exist
 func CreateHost(h *models.Host) error {
+	hosts, hErr := GetAllHosts()
+	clients, cErr := GetAllExtClients()
+	if (hErr != nil && !database.IsEmptyRecord(hErr)) ||
+		(cErr != nil && !database.IsEmptyRecord(cErr)) ||
+		len(hosts)+len(clients) >= MachinesLimit {
+		return errors.New("free tier limits exceeded on machines")
+	}
 	_, err := GetHost(h.ID.String())
 	if (err != nil && !database.IsEmptyRecord(err)) || (err == nil) {
 		return ErrHostExists
-	}
-	if servercfg.IsUsingTurn() {
-		err = RegisterHostWithTurn(h.ID.String(), h.HostPass)
-		if err != nil {
-			logger.Log(0, "failed to register host with turn server: ", err.Error())
-		}
 	}
 
 	// encrypt that password so we never see it
@@ -111,15 +202,6 @@ func CreateHost(h *models.Host) error {
 	}
 	h.HostPass = string(hash)
 	h.AutoUpdate = servercfg.AutoUpdateEnabled()
-	// if another server has already updated proxyenabled, leave it alone
-	if !h.ProxyEnabledSet {
-		log.Println("checking default proxy", servercfg.GetServerConfig().DefaultProxyMode)
-		if servercfg.GetServerConfig().DefaultProxyMode.Set {
-			h.ProxyEnabledSet = true
-			h.ProxyEnabled = servercfg.GetServerConfig().DefaultProxyMode.Value
-			log.Println("set proxy enabled to ", h.ProxyEnabled)
-		}
-	}
 	checkForZombieHosts(h)
 	return UpsertHost(h)
 }
@@ -135,9 +217,7 @@ func UpdateHost(newHost, currentHost *models.Host) {
 	newHost.Debug = currentHost.Debug
 	newHost.Nodes = currentHost.Nodes
 	newHost.PublicKey = currentHost.PublicKey
-	newHost.InternetGateway = currentHost.InternetGateway
 	newHost.TrafficKeyPublic = currentHost.TrafficKeyPublic
-
 	// changeable fields
 	if len(newHost.Version) == 0 {
 		newHost.Version = currentHost.Version
@@ -155,16 +235,13 @@ func UpdateHost(newHost, currentHost *models.Host) {
 		newHost.ListenPort = currentHost.ListenPort
 	}
 
-	if newHost.ProxyListenPort == 0 {
-		newHost.ProxyListenPort = currentHost.ProxyListenPort
+	if newHost.PersistentKeepalive == 0 {
+		newHost.PersistentKeepalive = currentHost.PersistentKeepalive
 	}
-	newHost.PublicListenPort = currentHost.PublicListenPort
-
 }
 
 // UpdateHostFromClient - used for updating host on server with update recieved from client
 func UpdateHostFromClient(newHost, currHost *models.Host) (sendPeerUpdate bool) {
-
 	if newHost.PublicKey != currHost.PublicKey {
 		currHost.PublicKey = newHost.PublicKey
 		sendPeerUpdate = true
@@ -173,29 +250,45 @@ func UpdateHostFromClient(newHost, currHost *models.Host) (sendPeerUpdate bool) 
 		currHost.ListenPort = newHost.ListenPort
 		sendPeerUpdate = true
 	}
-	if newHost.ProxyListenPort != 0 && currHost.ProxyListenPort != newHost.ProxyListenPort {
-		currHost.ProxyListenPort = newHost.ProxyListenPort
+	if newHost.WgPublicListenPort != 0 &&
+		currHost.WgPublicListenPort != newHost.WgPublicListenPort {
+		currHost.WgPublicListenPort = newHost.WgPublicListenPort
 		sendPeerUpdate = true
 	}
-	if newHost.PublicListenPort != 0 && currHost.PublicListenPort != newHost.PublicListenPort {
-		currHost.PublicListenPort = newHost.PublicListenPort
-		sendPeerUpdate = true
-	}
-	if currHost.ProxyEnabled != newHost.ProxyEnabled {
-		currHost.ProxyEnabled = newHost.ProxyEnabled
-		sendPeerUpdate = true
-	}
+	isEndpointChanged := false
 	if currHost.EndpointIP.String() != newHost.EndpointIP.String() {
 		currHost.EndpointIP = newHost.EndpointIP
 		sendPeerUpdate = true
+		isEndpointChanged = true
 	}
+	if currHost.EndpointIPv6.String() != newHost.EndpointIPv6.String() {
+		currHost.EndpointIPv6 = newHost.EndpointIPv6
+		sendPeerUpdate = true
+		isEndpointChanged = true
+	}
+
+	if isEndpointChanged {
+		for _, nodeID := range currHost.Nodes {
+			node, err := GetNodeByID(nodeID)
+			if err != nil {
+				slog.Error("failed to get node:", "id", node.ID, "error", err)
+				continue
+			}
+			if node.FailedOverBy != uuid.Nil {
+				ResetFailedOverPeer(&node)
+			}
+		}
+	}
+
 	currHost.DaemonInstalled = newHost.DaemonInstalled
 	currHost.Debug = newHost.Debug
 	currHost.Verbosity = newHost.Verbosity
 	currHost.Version = newHost.Version
-	if newHost.Name != "" {
-		currHost.Name = newHost.Name
-	}
+	currHost.IsStaticPort = newHost.IsStaticPort
+	currHost.IsStatic = newHost.IsStatic
+	currHost.MTU = newHost.MTU
+
+	currHost.Name = newHost.Name
 	if len(newHost.NatType) > 0 && newHost.NatType != currHost.NatType {
 		currHost.NatType = newHost.NatType
 		sendPeerUpdate = true
@@ -210,28 +303,56 @@ func UpsertHost(h *models.Host) error {
 	if err != nil {
 		return err
 	}
+	err = database.Insert(h.ID.String(), string(data), database.HOSTS_TABLE_NAME)
+	if err != nil {
+		return err
+	}
+	if servercfg.CacheEnabled() {
+		storeHostInCache(*h)
+	}
 
-	return database.Insert(h.ID.String(), string(data), database.HOSTS_TABLE_NAME)
+	return nil
 }
 
 // RemoveHost - removes a given host from server
-func RemoveHost(h *models.Host) error {
-	if len(h.Nodes) > 0 {
+func RemoveHost(h *models.Host, forceDelete bool) error {
+	if !forceDelete && len(h.Nodes) > 0 {
 		return fmt.Errorf("host still has associated nodes")
 	}
-	if servercfg.IsUsingTurn() {
-		DeRegisterHostWithTurn(h.ID.String())
+
+	if len(h.Nodes) > 0 {
+		if err := DisassociateAllNodesFromHost(h.ID.String()); err != nil {
+			return err
+		}
 	}
 
-	return database.DeleteRecord(database.HOSTS_TABLE_NAME, h.ID.String())
+	err := database.DeleteRecord(database.HOSTS_TABLE_NAME, h.ID.String())
+	if err != nil {
+		return err
+	}
+	if servercfg.CacheEnabled() {
+		deleteHostFromCache(h.ID.String())
+	}
+	go func() {
+		if servercfg.IsDNSMode() {
+			SetDNS()
+		}
+	}()
+
+	return nil
 }
 
 // RemoveHostByID - removes a given host by id from server
 func RemoveHostByID(hostID string) error {
-	if servercfg.IsUsingTurn() {
-		DeRegisterHostWithTurn(hostID)
+
+	err := database.DeleteRecord(database.HOSTS_TABLE_NAME, hostID)
+	if err != nil {
+		return err
 	}
-	return database.DeleteRecord(database.HOSTS_TABLE_NAME, hostID)
+	if servercfg.CacheEnabled() {
+		deleteHostFromCache(hostID)
+	}
+	return nil
 }
 
 // UpdateHostNetwork - adds/deletes host from a network
@@ -295,24 +416,25 @@ func DissasociateNodeFromHost(n *models.Node, h *models.Host) error {
 	if len(h.Nodes) == 0 {
 		return fmt.Errorf("no nodes present in given host")
 	}
-	index := -1
+	nList := []string{}
 	for i := range h.Nodes {
-		if h.Nodes[i] == n.ID.String() {
-			index = i
-			break
+		if h.Nodes[i] != n.ID.String() {
+			nList = append(nList, h.Nodes[i])
 		}
 	}
-	if index < 0 {
-		if len(h.Nodes) == 0 {
-			return fmt.Errorf("node %s, not found in host, %s", n.ID.String(), h.ID.String())
+	h.Nodes = nList
+	go func() {
+		if servercfg.IsPro {
+			if clients, err := GetNetworkExtClients(n.Network); err != nil {
+				for i := range clients {
+					AllowClientNodeAccess(&clients[i], n.ID.String())
+				}
+			}
 		}
-	} else {
-		h.Nodes = RemoveStringSlice(h.Nodes, index)
-	}
-	if err := deleteNodeByID(n); err != nil {
+	}()
+	if err := DeleteNodeByID(n); err != nil {
 		return err
 	}
-
 	return UpsertHost(h)
 }
 
@@ -325,7 +447,7 @@ func DisassociateAllNodesFromHost(hostID string) error {
 	for _, nodeID := range host.Nodes {
 		node, err := GetNodeByID(nodeID)
 		if err != nil {
-			logger.Log(0, "failed to get host node", err.Error())
+			logger.Log(0, "failed to get host node, node id:", nodeID, err.Error())
 			continue
 		}
 		if err := DeleteNode(&node, true); err != nil {
@@ -407,28 +529,19 @@ func CheckHostPorts(h *models.Host) {
 	}
 	for _, host := range hosts {
 		if host.ID.String() == h.ID.String() {
-			//skip self
+			// skip self
 			continue
 		}
 		if !host.EndpointIP.Equal(h.EndpointIP) {
 			continue
 		}
 		portsInUse[host.ListenPort] = true
-		portsInUse[host.ProxyListenPort] = true
 	}
 	// iterate until port is not found or max iteration is reached
 	for i := 0; portsInUse[h.ListenPort] && i < maxPort-minPort+1; i++ {
 		h.ListenPort++
 		if h.ListenPort > maxPort {
 			h.ListenPort = minPort
-		}
-	}
-	// allocate h.ListenPort so it is unavailable to h.ProxyListenPort
-	portsInUse[h.ListenPort] = true
-	for i := 0; portsInUse[h.ProxyListenPort] && i < maxPort-minPort+1; i++ {
-		h.ProxyListenPort++
-		if h.ProxyListenPort > maxPort {
-			h.ProxyListenPort = minPort
 		}
 	}
 }
@@ -457,52 +570,6 @@ func GetHostByNodeID(id string) *models.Host {
 // ConvHostPassToHash - converts password to md5 hash
 func ConvHostPassToHash(hostPass string) string {
 	return fmt.Sprintf("%x", md5.Sum([]byte(hostPass)))
-}
-
-// RegisterHostWithTurn - registers the host with the given turn server
-func RegisterHostWithTurn(hostID, hostPass string) error {
-	auth := servercfg.GetTurnUserName() + ":" + servercfg.GetTurnPassword()
-	api := httpclient.JSONEndpoint[models.SuccessResponse, models.ErrorResponse]{
-		URL:           servercfg.GetTurnApiHost(),
-		Route:         "/api/v1/host/register",
-		Method:        http.MethodPost,
-		Authorization: fmt.Sprintf("Basic %s", base64.StdEncoding.EncodeToString([]byte(auth))),
-		Data: models.HostTurnRegister{
-			HostID:       hostID,
-			HostPassHash: ConvHostPassToHash(hostPass),
-		},
-		Response:      models.SuccessResponse{},
-		ErrorResponse: models.ErrorResponse{},
-	}
-	_, errData, err := api.GetJSON(models.SuccessResponse{}, models.ErrorResponse{})
-	if err != nil {
-		if errors.Is(err, httpclient.ErrStatus) {
-			logger.Log(1, "error server status", strconv.Itoa(errData.Code), errData.Message)
-		}
-		return err
-	}
-	return nil
-}
-
-// DeRegisterHostWithTurn - to be called when host need to be deregistered from a turn server
-func DeRegisterHostWithTurn(hostID string) error {
-	auth := servercfg.GetTurnUserName() + ":" + servercfg.GetTurnPassword()
-	api := httpclient.JSONEndpoint[models.SuccessResponse, models.ErrorResponse]{
-		URL:           servercfg.GetTurnApiHost(),
-		Route:         fmt.Sprintf("/api/v1/host/deregister?host_id=%s", hostID),
-		Method:        http.MethodPost,
-		Authorization: fmt.Sprintf("Basic %s", base64.StdEncoding.EncodeToString([]byte(auth))),
-		Response:      models.SuccessResponse{},
-		ErrorResponse: models.ErrorResponse{},
-	}
-	_, errData, err := api.GetJSON(models.SuccessResponse{}, models.ErrorResponse{})
-	if err != nil {
-		if errors.Is(err, httpclient.ErrStatus) {
-			logger.Log(1, "error server status", strconv.Itoa(errData.Code), errData.Message)
-		}
-		return err
-	}
-	return nil
 }
 
 // SortApiHosts - Sorts slice of ApiHosts by their ID alphabetically with numbers first

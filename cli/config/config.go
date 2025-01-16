@@ -18,6 +18,8 @@ type Context struct {
 	Current   bool   `yaml:"current,omitempty"`
 	AuthToken string `yaml:"auth_token,omitempty"`
 	SSO       bool   `yaml:"sso,omitempty"`
+	TenantId  string `yaml:"tenant_id,omitempty"`
+	Saas      bool   `yaml:"saas,omitempty"`
 }
 
 var (
@@ -84,7 +86,7 @@ func GetCurrentContext() (name string, ctx Context) {
 			return
 		}
 	}
-	log.Fatalf("No current context set, do so via `netmaker context use <name>`")
+	log.Fatalf("No current context set, do so via `nmctl context use <name>`")
 	return
 }
 

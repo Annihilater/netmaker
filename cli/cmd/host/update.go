@@ -5,21 +5,23 @@ import (
 	"log"
 	"os"
 
+	"github.com/spf13/cobra"
+
 	"github.com/gravitl/netmaker/cli/functions"
 	"github.com/gravitl/netmaker/models"
-	"github.com/spf13/cobra"
 )
 
 var (
 	apiHostFilePath string
 	endpoint        string
+	endpoint6       string
 	name            string
 	listenPort      int
-	proxyListenPort int
 	mtu             int
-	proxyEnabled    bool
+	isStaticPort    bool
 	isStatic        bool
 	isDefault       bool
+	keepAlive       int
 )
 
 var hostUpdateCmd = &cobra.Command{
@@ -40,13 +42,14 @@ var hostUpdateCmd = &cobra.Command{
 		} else {
 			apiHost.ID = args[0]
 			apiHost.EndpointIP = endpoint
+			apiHost.EndpointIPv6 = endpoint6
 			apiHost.Name = name
 			apiHost.ListenPort = listenPort
-			apiHost.ProxyListenPort = proxyListenPort
 			apiHost.MTU = mtu
-			apiHost.ProxyEnabled = proxyEnabled
+			apiHost.IsStaticPort = isStaticPort
 			apiHost.IsStatic = isStatic
 			apiHost.IsDefault = isDefault
+			apiHost.PersistentKeepalive = keepAlive
 		}
 		functions.PrettyPrint(functions.UpdateHost(args[0], apiHost))
 	},
@@ -55,12 +58,13 @@ var hostUpdateCmd = &cobra.Command{
 func init() {
 	hostUpdateCmd.Flags().StringVar(&apiHostFilePath, "file", "", "Path to host_definition.json")
 	hostUpdateCmd.Flags().StringVar(&endpoint, "endpoint", "", "Endpoint of the Host")
+	hostUpdateCmd.Flags().StringVar(&endpoint6, "endpoint6", "", "IPv6 Endpoint of the Host")
 	hostUpdateCmd.Flags().StringVar(&name, "name", "", "Host name")
 	hostUpdateCmd.Flags().IntVar(&listenPort, "listen_port", 0, "Listen port of the host")
-	hostUpdateCmd.Flags().IntVar(&proxyListenPort, "proxy_listen_port", 0, "Proxy listen port of the host")
 	hostUpdateCmd.Flags().IntVar(&mtu, "mtu", 0, "Host MTU size")
-	hostUpdateCmd.Flags().BoolVar(&proxyEnabled, "proxy", false, "Enable proxy ?")
-	hostUpdateCmd.Flags().BoolVar(&isStatic, "static", false, "Make Host Static ?")
+	hostUpdateCmd.Flags().IntVar(&keepAlive, "keep_alive", 0, "Interval (seconds) in which packets are sent to keep connections open with peers")
+	hostUpdateCmd.Flags().BoolVar(&isStaticPort, "static_port", false, "Make Host Static Port?")
+	hostUpdateCmd.Flags().BoolVar(&isStatic, "static_endpoint", false, "Make Host Static Endpoint?")
 	hostUpdateCmd.Flags().BoolVar(&isDefault, "default", false, "Make Host Default ?")
 	rootCmd.AddCommand(hostUpdateCmd)
 }

@@ -4,31 +4,44 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"reflect"
 	"strconv"
+	"strings"
 
+	"github.com/go-playground/validator/v10"
 	"github.com/gorilla/mux"
 	"github.com/gravitl/netmaker/database"
-	"github.com/gravitl/netmaker/functions"
 	"github.com/gravitl/netmaker/logger"
 	"github.com/gravitl/netmaker/logic"
-	"github.com/gravitl/netmaker/logic/pro"
+	"github.com/gravitl/netmaker/servercfg"
+
 	"github.com/gravitl/netmaker/models"
-	"github.com/gravitl/netmaker/models/promodels"
+
 	"github.com/gravitl/netmaker/mq"
 	"github.com/skip2/go-qrcode"
+	"golang.org/x/exp/slices"
+	"golang.org/x/exp/slog"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
 func extClientHandlers(r *mux.Router) {
 
-	r.HandleFunc("/api/extclients", logic.SecurityCheck(false, http.HandlerFunc(getAllExtClients))).Methods(http.MethodGet)
-	r.HandleFunc("/api/extclients/{network}", logic.SecurityCheck(false, http.HandlerFunc(getNetworkExtClients))).Methods(http.MethodGet)
-	r.HandleFunc("/api/extclients/{network}/{clientid}", logic.SecurityCheck(false, http.HandlerFunc(getExtClient))).Methods(http.MethodGet)
-	r.HandleFunc("/api/extclients/{network}/{clientid}/{type}", logic.NetUserSecurityCheck(false, true, http.HandlerFunc(getExtClientConf))).Methods(http.MethodGet)
-	r.HandleFunc("/api/extclients/{network}/{clientid}", logic.NetUserSecurityCheck(false, true, http.HandlerFunc(updateExtClient))).Methods(http.MethodPut)
-	r.HandleFunc("/api/extclients/{network}/{clientid}", logic.NetUserSecurityCheck(false, true, http.HandlerFunc(deleteExtClient))).Methods(http.MethodDelete)
-	r.HandleFunc("/api/extclients/{network}/{nodeid}", logic.NetUserSecurityCheck(false, true, checkFreeTierLimits(clients_l, http.HandlerFunc(createExtClient)))).Methods(http.MethodPost)
+	r.HandleFunc("/api/extclients", logic.SecurityCheck(true, http.HandlerFunc(getAllExtClients))).
+		Methods(http.MethodGet)
+	r.HandleFunc("/api/extclients/{network}", logic.SecurityCheck(true, http.HandlerFunc(getNetworkExtClients))).
+		Methods(http.MethodGet)
+	r.HandleFunc("/api/extclients/{network}/{clientid}", logic.SecurityCheck(false, http.HandlerFunc(getExtClient))).
+		Methods(http.MethodGet)
+	r.HandleFunc("/api/extclients/{network}/{clientid}/{type}", logic.SecurityCheck(false, http.HandlerFunc(getExtClientConf))).
+		Methods(http.MethodGet)
+	r.HandleFunc("/api/extclients/{network}/{clientid}", logic.SecurityCheck(false, http.HandlerFunc(updateExtClient))).
+		Methods(http.MethodPut)
+	r.HandleFunc("/api/extclients/{network}/{clientid}", logic.SecurityCheck(false, http.HandlerFunc(deleteExtClient))).
+		Methods(http.MethodDelete)
+	r.HandleFunc("/api/extclients/{network}/{nodeid}", logic.SecurityCheck(false, checkFreeTierLimits(limitChoiceMachines, http.HandlerFunc(createExtClient)))).
+		Methods(http.MethodPost)
 }
 
 func checkIngressExists(nodeID string) bool {
@@ -39,18 +52,12 @@ func checkIngressExists(nodeID string) bool {
 	return node.IsIngressGateway
 }
 
-// swagger:route GET /api/extclients/{network} ext_client getNetworkExtClients
-//
-// Get all extclients associated with network.
-// Gets all extclients associated with network, including pending extclients.
-//
-//			Schemes: https
-//
-//			Security:
-//	  		oauth
-//
-//			Responses:
-//				200: extClientSliceResponse
+// @Summary     Get all remote access client associated with network
+// @Router      /api/extclients/{network} [get]
+// @Tags        Remote Access Client
+// @Security    oauth2
+// @Success     200 {object} models.ExtClient
+// @Failure     500 {object} models.ErrorResponse
 func getNetworkExtClients(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
@@ -71,68 +78,37 @@ func getNetworkExtClients(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(extclients)
 }
 
-// swagger:route GET /api/extclients ext_client getAllExtClients
-//
-// A separate function to get all extclients, not just extclients for a particular network.
-//
-//			Schemes: https
-//
-//			Security:
-//	  		oauth
-//
-//			Responses:
-//				200: extClientSliceResponse
-//
+// @Summary     Fetches All Remote Access Clients across all networks
+// @Router      /api/extclients [get]
+// @Tags        Remote Access Client
+// @Security    oauth2
+// @Success     200 {object} models.ExtClient
+// @Failure     500 {object} models.ErrorResponse
 // Not quite sure if this is necessary. Probably necessary based on front end but may
 // want to review after iteration 1 if it's being used or not
 func getAllExtClients(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 
-	headerNetworks := r.Header.Get("networks")
-	networksSlice := []string{}
-	marshalErr := json.Unmarshal([]byte(headerNetworks), &networksSlice)
-	if marshalErr != nil {
-		logger.Log(0, "error unmarshalling networks: ",
-			marshalErr.Error())
-		logic.ReturnErrorResponse(w, r, logic.FormatError(marshalErr, "internal"))
+	clients, err := logic.GetAllExtClients()
+	if err != nil && !database.IsEmptyRecord(err) {
+		logger.Log(0, "failed to get all extclients: ", err.Error())
+		logic.ReturnErrorResponse(w, r, logic.FormatError(err, "internal"))
 		return
 	}
-	clients := []models.ExtClient{}
-	var err error
-	if len(networksSlice) > 0 && networksSlice[0] == logic.ALL_NETWORK_ACCESS {
-		clients, err = functions.GetAllExtClients()
-		if err != nil && !database.IsEmptyRecord(err) {
-			logger.Log(0, "failed to get all extclients: ", err.Error())
-			logic.ReturnErrorResponse(w, r, logic.FormatError(err, "internal"))
-			return
-		}
-	} else {
-		for _, network := range networksSlice {
-			extclients, err := logic.GetNetworkExtClients(network)
-			if err == nil {
-				clients = append(clients, extclients...)
-			}
-		}
-	}
-
 	//Return all the extclients in JSON format
 	logic.SortExtClient(clients[:])
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(clients)
 }
 
-// swagger:route GET /api/extclients/{network}/{clientid} ext_client getExtClient
-//
-// Get an individual extclient.
-//
-//			Schemes: https
-//
-//			Security:
-//	  		oauth
-//
-//			Responses:
-//				200: extClientResponse
+// @Summary     Get an individual remote access client
+// @Router      /api/extclients/{network}/{clientid} [get]
+// @Tags        Remote Access Client
+// @Security    oauth2
+// @Success     200 {object} models.ExtClient
+// @Failure     500 {object} models.ErrorResponse
+// @Failure     403 {object} models.ErrorResponse
 func getExtClient(w http.ResponseWriter, r *http.Request) {
 	// set header.
 	w.Header().Set("Content-Type", "application/json")
@@ -143,8 +119,12 @@ func getExtClient(w http.ResponseWriter, r *http.Request) {
 	network := params["network"]
 	client, err := logic.GetExtClient(clientid, network)
 	if err != nil {
-		logger.Log(0, r.Header.Get("user"), fmt.Sprintf("failed to get extclient for [%s] on network [%s]: %v",
-			clientid, network, err))
+		logger.Log(
+			0,
+			r.Header.Get("user"),
+			fmt.Sprintf("failed to get extclient for [%s] on network [%s]: %v",
+				clientid, network, err),
+		)
 		logic.ReturnErrorResponse(w, r, logic.FormatError(err, "internal"))
 		return
 	}
@@ -153,17 +133,13 @@ func getExtClient(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(client)
 }
 
-// swagger:route GET /api/extclients/{network}/{clientid}/{type} ext_client getExtClientConf
-//
-// Get an individual extclient.
-//
-//			Schemes: https
-//
-//			Security:
-//	  		oauth
-//
-//			Responses:
-//				200: extClientResponse
+// @Summary     Get an individual remote access client
+// @Router      /api/extclients/{network}/{clientid}/{type} [get]
+// @Tags        Remote Access Client
+// @Security    oauth2
+// @Success     200 {object} models.ExtClient
+// @Failure     500 {object} models.ErrorResponse
+// @Failure     403 {object} models.ErrorResponse
 func getExtClientConf(w http.ResponseWriter, r *http.Request) {
 	// set header.
 	w.Header().Set("Content-Type", "application/json")
@@ -173,32 +149,84 @@ func getExtClientConf(w http.ResponseWriter, r *http.Request) {
 	networkid := params["network"]
 	client, err := logic.GetExtClient(clientid, networkid)
 	if err != nil {
-		logger.Log(0, r.Header.Get("user"), fmt.Sprintf("failed to get extclient for [%s] on network [%s]: %v",
-			clientid, networkid, err))
+		logger.Log(
+			0,
+			r.Header.Get("user"),
+			fmt.Sprintf("failed to get extclient for [%s] on network [%s]: %v",
+				clientid, networkid, err),
+		)
 		logic.ReturnErrorResponse(w, r, logic.FormatError(err, "internal"))
 		return
 	}
 
 	gwnode, err := logic.GetNodeByID(client.IngressGatewayID)
 	if err != nil {
-		logger.Log(0, r.Header.Get("user"),
-			fmt.Sprintf("failed to get ingress gateway node [%s] info: %v", client.IngressGatewayID, err))
+		logger.Log(
+			0,
+			r.Header.Get("user"),
+			fmt.Sprintf(
+				"failed to get ingress gateway node [%s] info: %v",
+				client.IngressGatewayID,
+				err,
+			),
+		)
 		logic.ReturnErrorResponse(w, r, logic.FormatError(err, "internal"))
 		return
 	}
 	host, err := logic.GetHost(gwnode.HostID.String())
 	if err != nil {
-		logger.Log(0, r.Header.Get("user"),
-			fmt.Sprintf("failed to get host for ingress gateway node [%s] info: %v", client.IngressGatewayID, err))
+		logger.Log(
+			0,
+			r.Header.Get("user"),
+			fmt.Sprintf(
+				"failed to get host for ingress gateway node [%s] info: %v",
+				client.IngressGatewayID,
+				err,
+			),
+		)
 		logic.ReturnErrorResponse(w, r, logic.FormatError(err, "internal"))
 		return
 	}
 
 	network, err := logic.GetParentNetwork(client.Network)
 	if err != nil {
-		logger.Log(1, r.Header.Get("user"), "Could not retrieve Ingress Gateway Network", client.Network)
+		logger.Log(
+			1,
+			r.Header.Get("user"),
+			"Could not retrieve Ingress Gateway Network",
+			client.Network,
+		)
 		logic.ReturnErrorResponse(w, r, logic.FormatError(err, "internal"))
 		return
+	}
+
+	preferredIp := strings.TrimSpace(r.URL.Query().Get("preferredip"))
+	if preferredIp != "" {
+		allowedPreferredIps := []string{}
+		for i := range gwnode.AdditionalRagIps {
+			allowedPreferredIps = append(allowedPreferredIps, gwnode.AdditionalRagIps[i].String())
+		}
+		allowedPreferredIps = append(allowedPreferredIps, host.EndpointIP.String())
+		allowedPreferredIps = append(allowedPreferredIps, host.EndpointIPv6.String())
+		if !slices.Contains(allowedPreferredIps, preferredIp) {
+			slog.Warn(
+				"preferred endpoint ip is not associated with the RAG. proceeding with preferred ip",
+				"preferred ip",
+				preferredIp,
+			)
+			logic.ReturnErrorResponse(
+				w,
+				r,
+				logic.FormatError(
+					errors.New("preferred endpoint ip is not associated with the RAG"),
+					"badrequest",
+				),
+			)
+			return
+		}
+		if net.ParseIP(preferredIp).To4() == nil {
+			preferredIp = fmt.Sprintf("[%s]", preferredIp)
+		}
 	}
 
 	addrString := client.Address
@@ -216,32 +244,94 @@ func getExtClientConf(w http.ResponseWriter, r *http.Request) {
 	if network.DefaultKeepalive != 0 {
 		keepalive = "PersistentKeepalive = " + strconv.Itoa(int(network.DefaultKeepalive))
 	}
-	gwendpoint := host.EndpointIP.String() + ":" + strconv.Itoa(host.ListenPort)
-	newAllowedIPs := network.AddressRange
-	if newAllowedIPs != "" && network.AddressRange6 != "" {
-		newAllowedIPs += ","
+	if gwnode.IngressPersistentKeepalive != 0 {
+		keepalive = "PersistentKeepalive = " + strconv.Itoa(int(gwnode.IngressPersistentKeepalive))
 	}
-	if network.AddressRange6 != "" {
-		newAllowedIPs += network.AddressRange6
+
+	gwendpoint := ""
+	if preferredIp == "" {
+		if host.EndpointIP.To4() == nil {
+			gwendpoint = fmt.Sprintf("[%s]:%d", host.EndpointIPv6.String(), host.ListenPort)
+		} else {
+			gwendpoint = fmt.Sprintf("%s:%d", host.EndpointIP.String(), host.ListenPort)
+		}
+	} else {
+		gwendpoint = fmt.Sprintf("%s:%d", preferredIp, host.ListenPort)
 	}
-	if egressGatewayRanges, err := logic.GetEgressRangesOnNetwork(&client); err == nil {
-		for _, egressGatewayRange := range egressGatewayRanges {
-			newAllowedIPs += "," + egressGatewayRange
+
+	var newAllowedIPs string
+	if logic.IsInternetGw(gwnode) || gwnode.InternetGwID != "" {
+		egressrange := "0.0.0.0/0"
+		if gwnode.Address6.IP != nil && client.Address6 != "" {
+			egressrange += "," + "::/0"
+		}
+		newAllowedIPs = egressrange
+	} else {
+		newAllowedIPs = network.AddressRange
+		if newAllowedIPs != "" && network.AddressRange6 != "" {
+			newAllowedIPs += ","
+		}
+		if network.AddressRange6 != "" {
+			newAllowedIPs += network.AddressRange6
+		}
+		if egressGatewayRanges, err := logic.GetEgressRangesOnNetwork(&client); err == nil {
+			for _, egressGatewayRange := range egressGatewayRanges {
+				newAllowedIPs += "," + egressGatewayRange
+			}
 		}
 	}
+
 	defaultDNS := ""
-	if network.DefaultExtClientDNS != "" {
-		defaultDNS = "DNS = " + network.DefaultExtClientDNS
+	if client.DNS != "" {
+		defaultDNS = "DNS = " + client.DNS
+	} else if gwnode.IngressDNS != "" {
+		defaultDNS = "DNS = " + gwnode.IngressDNS
 	}
+	// if servercfg.GetManageDNS() {
+	// 	if gwnode.Address6.IP != nil {
+	// 		if defaultDNS == "" {
+	// 			defaultDNS = "DNS = " + gwnode.Address6.IP.String()
+	// 		} else {
+	// 			defaultDNS = defaultDNS + ", " + gwnode.Address6.IP.String()
+	// 		}
+	// 	}
+	// 	if gwnode.Address.IP != nil {
+	// 		if defaultDNS == "" {
+	// 			defaultDNS = "DNS = " + gwnode.Address.IP.String()
+	// 		} else {
+	// 			defaultDNS = defaultDNS + ", " + gwnode.Address.IP.String()
+	// 		}
+	// 	}
+	// }
 
 	defaultMTU := 1420
 	if host.MTU != 0 {
 		defaultMTU = host.MTU
 	}
+	if gwnode.IngressMTU != 0 {
+		defaultMTU = int(gwnode.IngressMTU)
+	}
+
+	postUp := strings.Builder{}
+	if client.PostUp != "" && params["type"] != "qr" {
+		for _, loc := range strings.Split(client.PostUp, "\n") {
+			postUp.WriteString(fmt.Sprintf("PostUp = %s\n", loc))
+		}
+	}
+
+	postDown := strings.Builder{}
+	if client.PostDown != "" && params["type"] != "qr" {
+		for _, loc := range strings.Split(client.PostDown, "\n") {
+			postDown.WriteString(fmt.Sprintf("PostDown = %s\n", loc))
+		}
+	}
+
 	config := fmt.Sprintf(`[Interface]
 Address = %s
 PrivateKey = %s
 MTU = %d
+%s
+%s
 %s
 
 [Peer]
@@ -254,10 +344,13 @@ Endpoint = %s
 		client.PrivateKey,
 		defaultMTU,
 		defaultDNS,
+		postUp.String(),
+		postDown.String(),
 		host.PublicKey,
 		newAllowedIPs,
 		gwendpoint,
-		keepalive)
+		keepalive,
+	)
 
 	if params["type"] == "qr" {
 		bytes, err := qrcode.Encode(config, qrcode.Medium, 220)
@@ -294,57 +387,94 @@ Endpoint = %s
 	json.NewEncoder(w).Encode(client)
 }
 
-// swagger:route POST /api/extclients/{network}/{nodeid} ext_client createExtClient
-//
-// Create an individual extclient.  Must have valid key and be unique.
-//
-//			Schemes: https
-//
-//			Security:
-//	  		oauth
+// @Summary     Create an individual remote access client
+// @Router      /api/extclients/{network}/{nodeid} [post]
+// @Tags        Remote Access Client
+// @Security    oauth2
+// @Success     200 {string} string "OK"
+// @Failure     500 {object} models.ErrorResponse
+// @Failure     400 {object} models.ErrorResponse
+// @Failure     403 {object} models.ErrorResponse
 func createExtClient(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
 	var params = mux.Vars(r)
-	networkName := params["network"]
 	nodeid := params["nodeid"]
 
 	ingressExists := checkIngressExists(nodeid)
 	if !ingressExists {
 		err := errors.New("ingress does not exist")
-		logger.Log(0, r.Header.Get("user"),
-			fmt.Sprintf("failed to create extclient on network [%s]: %v", networkName, err))
-		logic.ReturnErrorResponse(w, r, logic.FormatError(err, "internal"))
+		slog.Error("failed to create extclient", "user", r.Header.Get("user"), "error", err)
+		logic.ReturnErrorResponse(w, r, logic.FormatError(err, "badrequest"))
+		return
+	}
+	var customExtClient models.CustomExtClient
+	if err := json.NewDecoder(r.Body).Decode(&customExtClient); err != nil {
+		logic.ReturnErrorResponse(w, r, logic.FormatError(err, "badrequest"))
+		return
+	}
+	if err := validateCustomExtClient(&customExtClient, true); err != nil {
+		logic.ReturnErrorResponse(w, r, logic.FormatError(err, "badrequest"))
 		return
 	}
 
-	var extclient models.ExtClient
-	var customExtClient models.CustomExtClient
-
-	err := json.NewDecoder(r.Body).Decode(&customExtClient)
-	if err == nil {
-		if customExtClient.ClientID != "" && !validName(customExtClient.ClientID) {
-			logic.ReturnErrorResponse(w, r, logic.FormatError(errInvalidExtClientID, "badrequest"))
-			return
-		}
-		extclient.ClientID = customExtClient.ClientID
-		if len(customExtClient.PublicKey) > 0 {
-			if _, err := wgtypes.ParseKey(customExtClient.PublicKey); err != nil {
-				logic.ReturnErrorResponse(w, r, logic.FormatError(errInvalidExtClientPubKey, "badrequest"))
-				return
-			}
-			extclient.PublicKey = customExtClient.PublicKey
-		}
+	var gateway models.EgressGatewayRequest
+	gateway.NetID = params["network"]
+	gateway.Ranges = customExtClient.ExtraAllowedIPs
+	err := logic.ValidateEgressRange(gateway)
+	if err != nil {
+		logger.Log(0, r.Header.Get("user"), "error validating egress range: ", err.Error())
+		logic.ReturnErrorResponse(w, r, logic.FormatError(err, "badrequest"))
+		return
 	}
 
-	extclient.Network = networkName
-	extclient.IngressGatewayID = nodeid
 	node, err := logic.GetNodeByID(nodeid)
 	if err != nil {
 		logger.Log(0, r.Header.Get("user"),
 			fmt.Sprintf("failed to get ingress gateway node [%s] info: %v", nodeid, err))
 		logic.ReturnErrorResponse(w, r, logic.FormatError(err, "internal"))
 		return
+	}
+	var userName string
+	if r.Header.Get("ismaster") == "yes" {
+		userName = logic.MasterUser
+	} else {
+		caller, err := logic.GetUser(r.Header.Get("user"))
+		if err != nil {
+			logic.ReturnErrorResponse(w, r, logic.FormatError(err, "internal"))
+			return
+		}
+		userName = caller.UserName
+		// check if user has a config already for remote access client
+		extclients, err := logic.GetNetworkExtClients(node.Network)
+		if err != nil {
+			slog.Error("failed to get extclients", "error", err)
+			logic.ReturnErrorResponse(w, r, logic.FormatError(err, "internal"))
+			return
+		}
+		for _, extclient := range extclients {
+			if extclient.RemoteAccessClientID != "" &&
+				extclient.RemoteAccessClientID == customExtClient.RemoteAccessClientID && extclient.OwnerID == caller.UserName && nodeid == extclient.IngressGatewayID {
+				// extclient on the gw already exists for the remote access client
+				err = errors.New("remote client config already exists on the gateway")
+				slog.Error("failed to create extclient", "user", userName, "error", err)
+				logic.ReturnErrorResponse(w, r, logic.FormatError(err, "badrequest"))
+				return
+			}
+		}
+	}
+
+	extclient := logic.UpdateExtClient(&models.ExtClient{}, &customExtClient)
+	extclient.OwnerID = userName
+	extclient.RemoteAccessClientID = customExtClient.RemoteAccessClientID
+	extclient.IngressGatewayID = nodeid
+	extclient.Network = node.Network
+	extclient.Tags = make(map[models.TagID]struct{})
+	// extclient.Tags[models.TagID(fmt.Sprintf("%s.%s", extclient.Network,
+	// 	models.RemoteAccessTagName))] = struct{}{}
+	// set extclient dns to ingressdns if extclient dns is not explicitly set
+	if (extclient.DNS == "") && (node.IngressDNS != "") {
+		extclient.DNS = node.IngressDNS
 	}
 	host, err := logic.GetHost(node.HostID.String())
 	if err != nil {
@@ -353,82 +483,86 @@ func createExtClient(w http.ResponseWriter, r *http.Request) {
 		logic.ReturnErrorResponse(w, r, logic.FormatError(err, "internal"))
 		return
 	}
-	listenPort := host.ListenPort
-	if host.ProxyEnabled {
-		listenPort = host.ProxyListenPort
-	}
-	extclient.IngressGatewayEndpoint = host.EndpointIP.String() + ":" + strconv.FormatInt(int64(listenPort), 10)
+	listenPort := logic.GetPeerListenPort(host)
+	extclient.IngressGatewayEndpoint = fmt.Sprintf("%s:%d", host.EndpointIP.String(), listenPort)
 	extclient.Enabled = true
-	parentNetwork, err := logic.GetNetwork(networkName)
+	parentNetwork, err := logic.GetNetwork(node.Network)
 	if err == nil { // check if parent network default ACL is enabled (yes) or not (no)
 		extclient.Enabled = parentNetwork.DefaultACL == "yes"
 	}
-
-	if err := logic.SetClientDefaultACLs(&extclient); err != nil {
-		logger.Log(0, r.Header.Get("user"),
-			fmt.Sprintf("failed to assign ACLs to new ext client on network [%s]: %v", networkName, err))
-		logic.ReturnErrorResponse(w, r, logic.FormatError(err, "internal"))
-		return
+	extclient.Os = customExtClient.Os
+	extclient.DeviceName = customExtClient.DeviceName
+	if customExtClient.IsAlreadyConnectedToInetGw {
+		slog.Warn("RAC/Client is already connected to internet gateway. this may mask their real IP address", "client IP", customExtClient.PublicEndpoint)
 	}
+	extclient.PublicEndpoint = customExtClient.PublicEndpoint
+	extclient.Country = customExtClient.Country
 
 	if err = logic.CreateExtClient(&extclient); err != nil {
-		logger.Log(0, r.Header.Get("user"),
-			fmt.Sprintf("failed to create new ext client on network [%s]: %v", networkName, err))
+		slog.Error(
+			"failed to create extclient",
+			"user",
+			r.Header.Get("user"),
+			"network",
+			node.Network,
+			"error",
+			err,
+		)
 		logic.ReturnErrorResponse(w, r, logic.FormatError(err, "internal"))
 		return
 	}
 
-	var isAdmin bool
-	if r.Header.Get("ismaster") != "yes" {
-		userID := r.Header.Get("user")
-		if isAdmin, err = checkProClientAccess(userID, extclient.ClientID, &parentNetwork); err != nil {
-			logger.Log(0, userID, "attempted to create a client on network", networkName, "but they lack access")
-			logic.DeleteExtClient(networkName, extclient.ClientID)
+	slog.Info(
+		"created extclient",
+		"user",
+		r.Header.Get("user"),
+		"network",
+		node.Network,
+		"clientid",
+		extclient.ClientID,
+	)
+	w.WriteHeader(http.StatusOK)
+	go func() {
+		if err := logic.SetClientDefaultACLs(&extclient); err != nil {
+			slog.Error(
+				"failed to set default acls for extclient",
+				"user",
+				r.Header.Get("user"),
+				"network",
+				node.Network,
+				"error",
+				err,
+			)
 			logic.ReturnErrorResponse(w, r, logic.FormatError(err, "internal"))
 			return
 		}
-		if !isAdmin {
-			if err = pro.AssociateNetworkUserClient(userID, networkName, extclient.ClientID); err != nil {
-				logger.Log(0, "failed to associate client", extclient.ClientID, "to user", userID)
-			}
-			extclient.OwnerID = userID
-			if _, err := logic.UpdateExtClient(extclient.ClientID, extclient.Network, extclient.Enabled, &extclient, extclient.ACLs); err != nil {
-				logger.Log(0, "failed to add owner id", userID, "to client", extclient.ClientID)
-			}
-		}
-	}
-
-	logger.Log(0, r.Header.Get("user"), "created new ext client on network", networkName)
-	w.WriteHeader(http.StatusOK)
-	go func() {
-		if err := mq.PublishPeerUpdate(); err != nil {
+		if err := mq.PublishPeerUpdate(false); err != nil {
 			logger.Log(1, "error setting ext peers on "+nodeid+": "+err.Error())
 		}
-		if err := mq.PublishExtCLientDNS(&extclient); err != nil {
-			logger.Log(1, "error publishing extclient dns", err.Error())
+		if servercfg.IsDNSMode() {
+			logic.SetDNS()
 		}
 	}()
 }
 
-// swagger:route PUT /api/extclients/{network}/{clientid} ext_client updateExtClient
-//
-// Update an individual extclient.
-//
-//			Schemes: https
-//
-//			Security:
-//	  		oauth
-//
-//			Responses:
-//				200: extClientResponse
+// @Summary     Update an individual remote access client
+// @Router      /api/extclients/{network}/{clientid} [put]
+// @Tags        Remote Access Client
+// @Security    oauth2
+// @Success     200 {object} models.ExtClient
+// @Failure     500 {object} models.ErrorResponse
+// @Failure     400 {object} models.ErrorResponse
+// @Failure     403 {object} models.ErrorResponse
 func updateExtClient(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
 	var params = mux.Vars(r)
 
-	var newExtClient models.ExtClient
-	var oldExtClient models.ExtClient
-	err := json.NewDecoder(r.Body).Decode(&newExtClient)
+	var update models.CustomExtClient
+	//var oldExtClient models.ExtClient
+	var sendPeerUpdate bool
+	var replacePeers bool
+	err := json.NewDecoder(r.Body).Decode(&update)
 	if err != nil {
 		logger.Log(0, r.Header.Get("user"), "error decoding request body: ",
 			err.Error())
@@ -436,97 +570,149 @@ func updateExtClient(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	clientid := params["clientid"]
-	network := params["network"]
-	key, err := logic.GetRecordKey(clientid, network)
+	oldExtClient, err := logic.GetExtClientByName(clientid)
 	if err != nil {
-		logger.Log(0, r.Header.Get("user"),
-			fmt.Sprintf("failed to get record key for client [%s], network [%s]: %v",
-				clientid, network, err))
+		slog.Error(
+			"failed to retrieve extclient",
+			"user",
+			r.Header.Get("user"),
+			"id",
+			clientid,
+			"error",
+			err,
+		)
 		logic.ReturnErrorResponse(w, r, logic.FormatError(err, "internal"))
 		return
 	}
-	if !validName(newExtClient.ClientID) {
-		logic.ReturnErrorResponse(w, r, logic.FormatError(errInvalidExtClientID, "badrequest"))
-		return
-	}
-	data, err := database.FetchRecord(database.EXT_CLIENT_TABLE_NAME, key)
-	if err != nil {
-		logger.Log(0, r.Header.Get("user"),
-			fmt.Sprintf("failed to fetch  ext client record key [%s] from db for client [%s], network [%s]: %v",
-				key, clientid, network, err))
-		logic.ReturnErrorResponse(w, r, logic.FormatError(err, "internal"))
-		return
-	}
-	if err = json.Unmarshal([]byte(data), &oldExtClient); err != nil {
-		logger.Log(0, "error unmarshalling extclient: ",
-			err.Error())
-		logic.ReturnErrorResponse(w, r, logic.FormatError(err, "internal"))
-		return
-	}
-
-	// == PRO ==
-	networkName := params["network"]
-	var changedID = newExtClient.ClientID != oldExtClient.ClientID
-	if r.Header.Get("ismaster") != "yes" {
-		userID := r.Header.Get("user")
-		_, doesOwn := doesUserOwnClient(userID, params["clientid"], networkName)
-		if !doesOwn {
-			logic.ReturnErrorResponse(w, r, logic.FormatError(fmt.Errorf("user not permitted"), "internal"))
+	if oldExtClient.ClientID == update.ClientID {
+		if err := validateCustomExtClient(&update, false); err != nil {
+			logic.ReturnErrorResponse(w, r, logic.FormatError(err, "badrequest"))
+			return
+		}
+	} else {
+		if err := validateCustomExtClient(&update, true); err != nil {
+			logic.ReturnErrorResponse(w, r, logic.FormatError(err, "badrequest"))
 			return
 		}
 	}
-	if changedID && oldExtClient.OwnerID != "" {
-		if err := pro.DissociateNetworkUserClient(oldExtClient.OwnerID, networkName, oldExtClient.ClientID); err != nil {
-			logger.Log(0, "failed to dissociate client", oldExtClient.ClientID, "from user", oldExtClient.OwnerID)
-		}
-		if err := pro.AssociateNetworkUserClient(oldExtClient.OwnerID, networkName, newExtClient.ClientID); err != nil {
-			logger.Log(0, "failed to associate client", newExtClient.ClientID, "to user", oldExtClient.OwnerID)
-		}
-	}
-	// == END PRO ==
 
-	var changedEnabled = (newExtClient.Enabled != oldExtClient.Enabled) || // indicates there was a change in enablement
-		len(newExtClient.ACLs) != len(oldExtClient.ACLs)
-	// extra var need as logic.Update changes oldExtClient
-	currentClient := oldExtClient
-	newclient, err := logic.UpdateExtClient(newExtClient.ClientID, params["network"], newExtClient.Enabled, &oldExtClient, newExtClient.ACLs)
+	var gateway models.EgressGatewayRequest
+	gateway.NetID = params["network"]
+	gateway.Ranges = update.ExtraAllowedIPs
+	err = logic.ValidateEgressRange(gateway)
 	if err != nil {
-		logger.Log(0, r.Header.Get("user"),
-			fmt.Sprintf("failed to update ext client [%s], network [%s]: %v",
-				clientid, network, err))
+		logger.Log(0, r.Header.Get("user"), "error validating egress range: ", err.Error())
+		logic.ReturnErrorResponse(w, r, logic.FormatError(err, "badrequest"))
+		return
+	}
+
+	var changedID = update.ClientID != oldExtClient.ClientID
+
+	if !reflect.DeepEqual(update.DeniedACLs, oldExtClient.DeniedACLs) {
+		sendPeerUpdate = true
+		logic.SetClientACLs(&oldExtClient, update.DeniedACLs)
+	}
+	if !logic.IsSlicesEqual(update.ExtraAllowedIPs, oldExtClient.ExtraAllowedIPs) {
+		sendPeerUpdate = true
+	}
+
+	if update.Enabled != oldExtClient.Enabled {
+		sendPeerUpdate = true
+	}
+	if update.PublicKey != oldExtClient.PublicKey {
+		//remove old peer entry
+		sendPeerUpdate = true
+		replacePeers = true
+	}
+	newclient := logic.UpdateExtClient(&oldExtClient, &update)
+	if err := logic.DeleteExtClient(oldExtClient.Network, oldExtClient.ClientID); err != nil {
+		slog.Error(
+			"failed to delete ext client",
+			"user",
+			r.Header.Get("user"),
+			"id",
+			oldExtClient.ClientID,
+			"network",
+			oldExtClient.Network,
+			"error",
+			err,
+		)
 		logic.ReturnErrorResponse(w, r, logic.FormatError(err, "internal"))
 		return
 	}
-	logger.Log(0, r.Header.Get("user"), "updated ext client", newExtClient.ClientID)
-	if changedEnabled { // need to send a peer update to the ingress node as enablement of one of it's clients has changed
-		if ingressNode, err := logic.GetNodeByID(newclient.IngressGatewayID); err == nil {
-			if err = mq.PublishPeerUpdate(); err != nil {
-				logger.Log(1, "error setting ext peers on", ingressNode.ID.String(), ":", err.Error())
-			}
-		}
+	if err := logic.SaveExtClient(&newclient); err != nil {
+		slog.Error(
+			"failed to save ext client",
+			"user",
+			r.Header.Get("user"),
+			"id",
+			newclient.ClientID,
+			"network",
+			newclient.Network,
+			"error",
+			err,
+		)
+		logic.ReturnErrorResponse(w, r, logic.FormatError(err, "internal"))
+		return
 	}
+	logger.Log(0, r.Header.Get("user"), "updated ext client", update.ClientID)
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(newclient)
-	if changedID {
-		go func() {
-			if err := mq.PublishExtClientDNSUpdate(currentClient, newExtClient, networkName); err != nil {
-				logger.Log(1, "error pubishing dns update for extcient update", err.Error())
+
+	go func() {
+		if changedID && servercfg.IsDNSMode() {
+			logic.SetDNS()
+		}
+		if replacePeers {
+			if err := mq.PublishDeletedClientPeerUpdate(&oldExtClient); err != nil {
+				slog.Error("error deleting old ext peers", "error", err.Error())
 			}
-		}()
-	}
+		}
+		if sendPeerUpdate { // need to send a peer update to the ingress node as enablement of one of it's clients has changed
+			ingressNode, err := logic.GetNodeByID(newclient.IngressGatewayID)
+			if err == nil {
+				if err = mq.PublishPeerUpdate(false); err != nil {
+					logger.Log(
+						1,
+						"error setting ext peers on",
+						ingressNode.ID.String(),
+						":",
+						err.Error(),
+					)
+				}
+			}
+			if !update.Enabled {
+				ingressHost, err := logic.GetHost(ingressNode.HostID.String())
+				if err != nil {
+					slog.Error(
+						"Failed to get ingress host",
+						"node",
+						ingressNode.ID.String(),
+						"error",
+						err,
+					)
+					return
+				}
+				nodes, err := logic.GetAllNodes()
+				if err != nil {
+					slog.Error("Failed to get nodes", "error", err)
+					return
+				}
+				go mq.PublishSingleHostPeerUpdate(ingressHost, nodes, nil, []models.ExtClient{oldExtClient}, false, nil)
+			}
+		}
+
+	}()
+
 }
 
-// swagger:route DELETE /api/extclients/{network}/{clientid} ext_client deleteExtClient
-//
-// Delete an individual extclient.
-//
-//			Schemes: https
-//
-//			Security:
-//	  		oauth
-//
-//			Responses:
-//				200: successResponse
+// @Summary     Delete an individual remote access client
+// @Router      /api/extclients/{network}/{clientid} [delete]
+// @Tags        Remote Access Client
+// @Security    oauth2
+// @Success     200
+// @Failure     500 {object} models.ErrorResponse
+// @Failure     403 {object} models.ErrorResponse
 func deleteExtClient(w http.ResponseWriter, r *http.Request) {
 	// Set header
 	w.Header().Set("Content-Type", "application/json")
@@ -539,40 +725,28 @@ func deleteExtClient(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		err = errors.New("Could not delete extclient " + params["clientid"])
 		logger.Log(0, r.Header.Get("user"),
-			fmt.Sprintf("failed to delete extclient [%s],network [%s]: %v", clientid, network, err))
+			fmt.Sprintf("failed to get extclient [%s],network [%s]: %v", clientid, network, err))
 		logic.ReturnErrorResponse(w, r, logic.FormatError(err, "internal"))
 		return
 	}
 	ingressnode, err := logic.GetNodeByID(extclient.IngressGatewayID)
 	if err != nil {
-		logger.Log(0, r.Header.Get("user"),
-			fmt.Sprintf("failed to get ingress gateway node [%s] info: %v", extclient.IngressGatewayID, err))
+		logger.Log(
+			0,
+			r.Header.Get("user"),
+			fmt.Sprintf(
+				"failed to get ingress gateway node [%s] info: %v",
+				extclient.IngressGatewayID,
+				err,
+			),
+		)
 		logic.ReturnErrorResponse(w, r, logic.FormatError(err, "internal"))
 		return
 	}
 
-	// == PRO ==
-	if r.Header.Get("ismaster") != "yes" {
-		userID, clientID, networkName := r.Header.Get("user"), params["clientid"], params["network"]
-		_, doesOwn := doesUserOwnClient(userID, clientID, networkName)
-		if !doesOwn {
-			logic.ReturnErrorResponse(w, r, logic.FormatError(fmt.Errorf("user not permitted"), "internal"))
-			return
-		}
-	}
-
-	if extclient.OwnerID != "" {
-		if err = pro.DissociateNetworkUserClient(extclient.OwnerID, extclient.Network, extclient.ClientID); err != nil {
-			logger.Log(0, "failed to dissociate client", extclient.ClientID, "from user", extclient.OwnerID)
-		}
-	}
-
-	// == END PRO ==
-
-	err = logic.DeleteExtClient(params["network"], params["clientid"])
+	err = logic.DeleteExtClientAndCleanup(extclient)
 	if err != nil {
-		logger.Log(0, r.Header.Get("user"),
-			fmt.Sprintf("failed to delete extclient [%s],network [%s]: %v", clientid, network, err))
+		slog.Error("deleteExtClient: ", "Error", err.Error())
 		err = errors.New("Could not delete extclient " + params["clientid"])
 		logic.ReturnErrorResponse(w, r, logic.FormatError(err, "internal"))
 		return
@@ -580,10 +754,10 @@ func deleteExtClient(w http.ResponseWriter, r *http.Request) {
 
 	go func() {
 		if err := mq.PublishDeletedClientPeerUpdate(&extclient); err != nil {
-			logger.Log(1, "error setting ext peers on "+ingressnode.ID.String()+": "+err.Error())
+			slog.Error("error setting ext peers on " + ingressnode.ID.String() + ": " + err.Error())
 		}
-		if err = mq.PublishDeleteExtClientDNS(&extclient); err != nil {
-			logger.Log(1, "error publishing dns update for extclient deletion", err.Error())
+		if servercfg.IsDNSMode() {
+			logic.SetDNS()
 		}
 	}()
 
@@ -592,59 +766,60 @@ func deleteExtClient(w http.ResponseWriter, r *http.Request) {
 	logic.ReturnSuccessResponse(w, r, params["clientid"]+" deleted.")
 }
 
-func checkProClientAccess(username, clientID string, network *models.Network) (bool, error) {
-	u, err := logic.GetUser(username)
+// validateCustomExtClient	Validates the extclient object
+func validateCustomExtClient(customExtClient *models.CustomExtClient, checkID bool) error {
+	v := validator.New()
+	err := v.Struct(customExtClient)
 	if err != nil {
-		return false, err
+		return err
 	}
-	if u.IsAdmin {
-		return true, nil
-	}
-
-	netUser, err := pro.GetNetworkUser(network.NetID, promodels.NetworkUserID(u.UserName))
-	if err != nil {
-		return false, err
-	}
-
-	if netUser.AccessLevel == pro.NET_ADMIN {
-		return false, nil
-	}
-
-	if netUser.AccessLevel == pro.NO_ACCESS {
-		return false, fmt.Errorf("user does not have access")
-	}
-
-	if !(len(netUser.Clients) < netUser.ClientLimit) {
-		return false, fmt.Errorf("user can not create more clients")
-	}
-
-	if netUser.AccessLevel < pro.NO_ACCESS {
-		netUser.Clients = append(netUser.Clients, clientID)
-		if err = pro.UpdateNetworkUser(network.NetID, netUser); err != nil {
-			return false, err
+	//validate clientid
+	if customExtClient.ClientID != "" {
+		if err := isValid(customExtClient.ClientID, checkID); err != nil {
+			return fmt.Errorf("client validation: %v", err)
 		}
 	}
-	return false, nil
+	//extclient.ClientID = customExtClient.ClientID
+	if len(customExtClient.PublicKey) > 0 {
+		if _, err := wgtypes.ParseKey(customExtClient.PublicKey); err != nil {
+			return errInvalidExtClientPubKey
+		}
+		//extclient.PublicKey = customExtClient.PublicKey
+	}
+	//validate extra ips
+	if len(customExtClient.ExtraAllowedIPs) > 0 {
+		for _, ip := range customExtClient.ExtraAllowedIPs {
+			if _, _, err := net.ParseCIDR(ip); err != nil {
+				return errInvalidExtClientExtraIP
+			}
+		}
+		//extclient.ExtraAllowedIPs = customExtClient.ExtraAllowedIPs
+	}
+	//validate DNS
+	if customExtClient.DNS != "" {
+		if ip := net.ParseIP(customExtClient.DNS); ip == nil {
+			return errInvalidExtClientDNS
+		}
+		//extclient.DNS = customExtClient.DNS
+	}
+	return nil
 }
 
-// checks if net user owns an ext client or is an admin
-func doesUserOwnClient(username, clientID, network string) (bool, bool) {
-	u, err := logic.GetUser(username)
-	if err != nil {
-		return false, false
+// isValid	Checks if the clientid is valid
+func isValid(clientid string, checkID bool) error {
+	if !validName(clientid) {
+		return errInvalidExtClientID
 	}
-	if u.IsAdmin {
-		return true, true
+	if checkID {
+		extclients, err := logic.GetAllExtClients()
+		if err != nil {
+			return fmt.Errorf("extclients isValid: %v", err)
+		}
+		for _, extclient := range extclients {
+			if clientid == extclient.ClientID {
+				return errDuplicateExtClientName
+			}
+		}
 	}
-
-	netUser, err := pro.GetNetworkUser(network, promodels.NetworkUserID(u.UserName))
-	if err != nil {
-		return false, false
-	}
-
-	if netUser.AccessLevel == pro.NET_ADMIN {
-		return false, true
-	}
-
-	return false, logic.StringSliceContains(netUser.Clients, clientID)
+	return nil
 }

@@ -2,19 +2,26 @@ package logic
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
+	"regexp"
 	"sort"
 
 	validator "github.com/go-playground/validator/v10"
 	"github.com/gravitl/netmaker/database"
 	"github.com/gravitl/netmaker/logger"
 	"github.com/gravitl/netmaker/models"
+	"github.com/gravitl/netmaker/servercfg"
 	"github.com/txn2/txeh"
 )
 
 // SetDNS - sets the dns on file
 func SetDNS() error {
-	hostfile := txeh.Hosts{}
+	hostfile, err := txeh.NewHosts(&txeh.HostsConfig{})
+	if err != nil {
+		return err
+	}
 	var corefilestring string
 	networks, err := GetNetworks()
 	if err != nil && !database.IsEmptyRecord(err) {
@@ -28,8 +35,12 @@ func SetDNS() error {
 			return err
 		}
 		for _, entry := range dns {
-			hostfile.AddHost(entry.Address, entry.Name+"."+entry.Network)
+			hostfile.AddHost(entry.Address, entry.Name)
 		}
+	}
+	dns := GetExtclientDNS()
+	for _, entry := range dns {
+		hostfile.AddHost(entry.Address, entry.Name)
 	}
 	if corefilestring == "" {
 		corefilestring = "example.com"
@@ -64,21 +75,39 @@ func GetDNS(network string) ([]models.DNSEntry, error) {
 	return dns, nil
 }
 
+// GetExtclientDNS - gets all extclients dns entries
+func GetExtclientDNS() []models.DNSEntry {
+	extclients, err := GetAllExtClients()
+	if err != nil {
+		return []models.DNSEntry{}
+	}
+	var dns []models.DNSEntry
+	for _, extclient := range extclients {
+		var entry = models.DNSEntry{}
+		entry.Name = fmt.Sprintf("%s.%s", extclient.ClientID, extclient.Network)
+		entry.Network = extclient.Network
+		if extclient.Address != "" {
+			entry.Address = extclient.Address
+		}
+		if extclient.Address6 != "" {
+			entry.Address6 = extclient.Address6
+		}
+		dns = append(dns, entry)
+	}
+	return dns
+}
+
 // GetNodeDNS - gets the DNS of a network node
 func GetNodeDNS(network string) ([]models.DNSEntry, error) {
 
 	var dns []models.DNSEntry
 
-	collection, err := database.FetchRecords(database.NODES_TABLE_NAME)
+	nodes, err := GetNetworkNodes(network)
 	if err != nil {
 		return dns, err
 	}
-
-	for _, value := range collection {
-		var node models.Node
-		if err = json.Unmarshal([]byte(value), &node); err != nil {
-			continue
-		}
+	defaultDomain := servercfg.GetDefaultDomain()
+	for _, node := range nodes {
 		if node.Network != network {
 			continue
 		}
@@ -87,7 +116,11 @@ func GetNodeDNS(network string) ([]models.DNSEntry, error) {
 			continue
 		}
 		var entry = models.DNSEntry{}
-		entry.Name = host.Name
+		if defaultDomain == "" {
+			entry.Name = fmt.Sprintf("%s.%s", host.Name, network)
+		} else {
+			entry.Name = fmt.Sprintf("%s.%s.%s", host.Name, network, defaultDomain)
+		}
 		entry.Network = network
 		if node.Address.IP != nil {
 			entry.Address = node.Address.IP.String()
@@ -131,10 +164,7 @@ func SetCorefile(domains string) error {
 		return err
 	}
 
-	_, err = os.Stat(dir + "/config/dnsconfig")
-	if os.IsNotExist(err) {
-		err = os.MkdirAll(dir+"/config/dnsconfig", 0744)
-	}
+	err = os.MkdirAll(dir+"/config/dnsconfig", 0744)
 	if err != nil {
 		logger.Log(0, "couldnt find or create /config/dnsconfig")
 		return err
@@ -149,9 +179,7 @@ func SetCorefile(domains string) error {
     log
 }
 `
-	corebytes := []byte(corefile)
-
-	err = os.WriteFile(dir+"/config/dnsconfig/Corefile", corebytes, 0644)
+	err = os.WriteFile(dir+"/config/dnsconfig/Corefile", []byte(corefile), 0644)
 	if err != nil {
 		return err
 	}
@@ -202,10 +230,23 @@ func SortDNSEntrys(unsortedDNSEntrys []models.DNSEntry) {
 	})
 }
 
+// IsNetworkNameValid - checks if a netid of a network uses valid characters
+func IsDNSEntryValid(d string) bool {
+	re := regexp.MustCompile(`^[A-Za-z0-9-.]+$`)
+	return re.MatchString(d)
+}
+
 // ValidateDNSCreate - checks if an entry is valid
 func ValidateDNSCreate(entry models.DNSEntry) error {
-
+	if !IsDNSEntryValid(entry.Name) {
+		return errors.New("invalid input. Only uppercase letters (A-Z), lowercase letters (a-z), numbers (0-9), minus sign (-) and dots (.) are allowed")
+	}
 	v := validator.New()
+
+	_ = v.RegisterValidation("whitespace", func(f1 validator.FieldLevel) bool {
+		match, _ := regexp.MatchString(`\s`, entry.Name)
+		return !match
+	})
 
 	_ = v.RegisterValidation("name_unique", func(fl validator.FieldLevel) bool {
 		num, err := GetDNSEntryNum(entry.Name, entry.Network)
@@ -230,6 +271,11 @@ func ValidateDNSCreate(entry models.DNSEntry) error {
 func ValidateDNSUpdate(change models.DNSEntry, entry models.DNSEntry) error {
 
 	v := validator.New()
+
+	_ = v.RegisterValidation("whitespace", func(f1 validator.FieldLevel) bool {
+		match, _ := regexp.MatchString(`\s`, entry.Name)
+		return !match
+	})
 
 	_ = v.RegisterValidation("name_unique", func(fl validator.FieldLevel) bool {
 		//if name & net not changing name we are good

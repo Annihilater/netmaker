@@ -10,6 +10,7 @@ import (
 	"github.com/gravitl/netmaker/logic/acls"
 	"github.com/gravitl/netmaker/logic/acls/nodeacls"
 	"github.com/gravitl/netmaker/models"
+	"github.com/gravitl/netmaker/servercfg"
 	"github.com/stretchr/testify/assert"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
@@ -131,11 +132,7 @@ func TestGetNetworkNodes(t *testing.T) {
 
 func TestValidateEgressGateway(t *testing.T) {
 	var gateway models.EgressGatewayRequest
-	t.Run("EmptyRange", func(t *testing.T) {
-		gateway.Ranges = []string{}
-		err := logic.ValidateEgressGateway(gateway)
-		assert.EqualError(t, err, "IP Ranges Cannot Be Empty")
-	})
+
 	t.Run("Success", func(t *testing.T) {
 		gateway.Ranges = []string{"10.100.100.0/24"}
 		err := logic.ValidateEgressGateway(gateway)
@@ -217,6 +214,9 @@ func TestNodeACLs(t *testing.T) {
 }
 
 func deleteAllNodes() {
+	if servercfg.CacheEnabled() {
+		logic.ClearNodeCache()
+	}
 	database.DeleteAllRecords(database.NODES_TABLE_NAME)
 }
 

@@ -1,7 +1,6 @@
 package logic
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -11,6 +10,56 @@ import (
 	"github.com/gravitl/netmaker/models"
 	"github.com/gravitl/netmaker/servercfg"
 )
+
+// IsInternetGw - checks if node is acting as internet gw
+func IsInternetGw(node models.Node) bool {
+	return node.IsInternetGateway
+}
+
+// GetInternetGateways - gets all the nodes that are internet gateways
+func GetInternetGateways() ([]models.Node, error) {
+	nodes, err := GetAllNodes()
+	if err != nil {
+		return nil, err
+	}
+	igs := make([]models.Node, 0)
+	for _, node := range nodes {
+		if node.IsInternetGateway {
+			igs = append(igs, node)
+		}
+	}
+	return igs, nil
+}
+
+// GetAllIngresses - gets all the nodes that are ingresses
+func GetAllIngresses() ([]models.Node, error) {
+	nodes, err := GetAllNodes()
+	if err != nil {
+		return nil, err
+	}
+	ingresses := make([]models.Node, 0)
+	for _, node := range nodes {
+		if node.IsIngressGateway {
+			ingresses = append(ingresses, node)
+		}
+	}
+	return ingresses, nil
+}
+
+// GetAllEgresses - gets all the nodes that are egresses
+func GetAllEgresses() ([]models.Node, error) {
+	nodes, err := GetAllNodes()
+	if err != nil {
+		return nil, err
+	}
+	egresses := make([]models.Node, 0)
+	for _, node := range nodes {
+		if node.IsEgressGateway {
+			egresses = append(egresses, node)
+		}
+	}
+	return egresses, nil
+}
 
 // CreateEgressGateway - creates an egress gateway
 func CreateEgressGateway(gateway models.EgressGatewayRequest) (models.Node, error) {
@@ -26,11 +75,12 @@ func CreateEgressGateway(gateway models.EgressGatewayRequest) (models.Node, erro
 		return models.Node{}, errors.New(host.OS + " is unsupported for egress gateways")
 	}
 	if host.FirewallInUse == models.FIREWALL_NONE {
-		return models.Node{}, errors.New("firewall is not supported for egress gateways")
+		return models.Node{}, errors.New("please install iptables or nftables on the device")
 	}
 	for i := len(gateway.Ranges) - 1; i >= 0; i-- {
-		if gateway.Ranges[i] == "::/0" {
-			logger.Log(0, "currently IPv6 internet gateways are not supported", gateway.Ranges[i])
+		// check if internet gateway IPv4
+		if gateway.Ranges[i] == "0.0.0.0/0" || gateway.Ranges[i] == "::/0" {
+			// remove inet range
 			gateway.Ranges = append(gateway.Ranges[:i], gateway.Ranges[i+1:]...)
 			continue
 		}
@@ -48,16 +98,15 @@ func CreateEgressGateway(gateway models.EgressGatewayRequest) (models.Node, erro
 	if err != nil {
 		return models.Node{}, err
 	}
+	if gateway.Ranges == nil {
+		gateway.Ranges = make([]string, 0)
+	}
 	node.IsEgressGateway = true
 	node.EgressGatewayRanges = gateway.Ranges
 	node.EgressGatewayNatEnabled = models.ParseBool(gateway.NatEnabled)
 	node.EgressGatewayRequest = gateway // store entire request for use when preserving the egress gateway
 	node.SetLastModified()
-	nodeData, err := json.Marshal(&node)
-	if err != nil {
-		return node, err
-	}
-	if err = database.Insert(node.ID.String(), string(nodeData), database.NODES_TABLE_NAME); err != nil {
+	if err = UpsertNode(&node); err != nil {
 		return models.Node{}, err
 	}
 	return node, nil
@@ -65,13 +114,7 @@ func CreateEgressGateway(gateway models.EgressGatewayRequest) (models.Node, erro
 
 // ValidateEgressGateway - validates the egress gateway model
 func ValidateEgressGateway(gateway models.EgressGatewayRequest) error {
-	var err error
-
-	empty := len(gateway.Ranges) == 0
-	if empty {
-		err = errors.New("IP Ranges Cannot Be Empty")
-	}
-	return err
+	return nil
 }
 
 // DeleteEgressGateway - deletes egress from node
@@ -84,23 +127,21 @@ func DeleteEgressGateway(network, nodeid string) (models.Node, error) {
 	node.EgressGatewayRanges = []string{}
 	node.EgressGatewayRequest = models.EgressGatewayRequest{} // remove preserved request as the egress gateway is gone
 	node.SetLastModified()
-
-	data, err := json.Marshal(&node)
-	if err != nil {
-		return models.Node{}, err
-	}
-	if err = database.Insert(node.ID.String(), string(data), database.NODES_TABLE_NAME); err != nil {
+	if err = UpsertNode(&node); err != nil {
 		return models.Node{}, err
 	}
 	return node, nil
 }
 
 // CreateIngressGateway - creates an ingress gateway
-func CreateIngressGateway(netid string, nodeid string, failover bool) (models.Node, error) {
+func CreateIngressGateway(netid string, nodeid string, ingress models.IngressRequest) (models.Node, error) {
 
 	node, err := GetNodeByID(nodeid)
 	if err != nil {
 		return models.Node{}, err
+	}
+	if node.IsRelayed {
+		return models.Node{}, errors.New("ingress cannot be created on a relayed node")
 	}
 	host, err := GetHost(node.HostID.String())
 	if err != nil {
@@ -109,26 +150,41 @@ func CreateIngressGateway(netid string, nodeid string, failover bool) (models.No
 	if host.OS != "linux" {
 		return models.Node{}, errors.New("ingress can only be created on linux based node")
 	}
-	if host.FirewallInUse == models.FIREWALL_NONE {
-		return models.Node{}, errors.New("firewall is not supported for ingress gateways")
-	}
 
 	network, err := GetParentNetwork(netid)
 	if err != nil {
 		return models.Node{}, err
 	}
 	node.IsIngressGateway = true
+	if !servercfg.IsPro {
+		node.IsInternetGateway = ingress.IsInternetGateway
+	}
 	node.IngressGatewayRange = network.AddressRange
 	node.IngressGatewayRange6 = network.AddressRange6
+	node.IngressDNS = ingress.ExtclientDNS
+	node.IngressPersistentKeepalive = 20
+	if ingress.PersistentKeepalive != 0 {
+		node.IngressPersistentKeepalive = ingress.PersistentKeepalive
+	}
+	node.IngressMTU = 1420
+	if ingress.MTU != 0 {
+		node.IngressMTU = ingress.MTU
+	}
+	if servercfg.IsPro {
+		if _, exists := FailOverExists(node.Network); exists {
+			ResetFailedOverPeer(&node)
+		}
+	}
 	node.SetLastModified()
-	if failover && servercfg.Is_EE {
-		node.Failover = true
+	node.Metadata = ingress.Metadata
+	if node.Metadata == "" {
+		node.Metadata = "This host can be used for remote access"
 	}
-	data, err := json.Marshal(&node)
-	if err != nil {
-		return models.Node{}, err
+	if node.Tags == nil {
+		node.Tags = make(map[models.TagID]struct{})
 	}
-	err = database.Insert(node.ID.String(), string(data), database.NODES_TABLE_NAME)
+	node.Tags[models.TagID(fmt.Sprintf("%s.%s", netid, models.RemoteAccessTagName))] = struct{}{}
+	err = UpsertNode(&node)
 	if err != nil {
 		return models.Node{}, err
 	}
@@ -136,50 +192,59 @@ func CreateIngressGateway(netid string, nodeid string, failover bool) (models.No
 	return node, err
 }
 
+// GetIngressGwUsers - lists the users having to access to ingressGW
+func GetIngressGwUsers(node models.Node) (models.IngressGwUsers, error) {
+
+	gwUsers := models.IngressGwUsers{
+		NodeID:  node.ID.String(),
+		Network: node.Network,
+	}
+	users, err := GetUsers()
+	if err != nil {
+		return gwUsers, err
+	}
+	for _, user := range users {
+		if !user.IsAdmin && !user.IsSuperAdmin {
+			gwUsers.Users = append(gwUsers.Users, user)
+		}
+	}
+	return gwUsers, nil
+}
+
 // DeleteIngressGateway - deletes an ingress gateway
-func DeleteIngressGateway(networkName string, nodeid string) (models.Node, bool, []models.ExtClient, error) {
+func DeleteIngressGateway(nodeid string) (models.Node, []models.ExtClient, error) {
 	removedClients := []models.ExtClient{}
 	node, err := GetNodeByID(nodeid)
 	if err != nil {
-		return models.Node{}, false, removedClients, err
+		return models.Node{}, removedClients, err
 	}
-	clients, err := GetExtClientsByID(nodeid, networkName)
+	clients, err := GetExtClientsByID(nodeid, node.Network)
 	if err != nil && !database.IsEmptyRecord(err) {
-		return models.Node{}, false, removedClients, err
+		return models.Node{}, removedClients, err
 	}
 
 	removedClients = clients
 
 	// delete ext clients belonging to ingress gateway
-	if err = DeleteGatewayExtClients(node.ID.String(), networkName); err != nil {
-		return models.Node{}, false, removedClients, err
+	if err = DeleteGatewayExtClients(node.ID.String(), node.Network); err != nil {
+		return models.Node{}, removedClients, err
 	}
 	logger.Log(3, "deleting ingress gateway")
-	wasFailover := node.Failover
 	node.LastModified = time.Now()
 	node.IsIngressGateway = false
+	if !servercfg.IsPro {
+		node.IsInternetGateway = false
+	}
+	delete(node.Tags, models.TagID(fmt.Sprintf("%s.%s", node.Network, models.RemoteAccessTagName)))
 	node.IngressGatewayRange = ""
-	node.Failover = false
-
-	//logger.Log(3, "deleting ingress gateway firewall in use is '", host.FirewallInUse, "' and isEgressGateway is", node.IsEgressGateway)
-	if node.EgressGatewayRequest.NodeID != "" {
-		_, err := CreateEgressGateway(node.EgressGatewayRequest)
-		if err != nil {
-			logger.Log(0, fmt.Sprintf("failed to create egress gateway on node [%s] on network [%s]: %v",
-				node.EgressGatewayRequest.NodeID, node.EgressGatewayRequest.NetID, err))
-		}
+	node.Metadata = ""
+	err = UpsertNode(&node)
+	if err != nil {
+		return models.Node{}, removedClients, err
 	}
 
-	data, err := json.Marshal(&node)
-	if err != nil {
-		return models.Node{}, false, removedClients, err
-	}
-	err = database.Insert(node.ID.String(), string(data), database.NODES_TABLE_NAME)
-	if err != nil {
-		return models.Node{}, wasFailover, removedClients, err
-	}
-	err = SetNetworkNodesLastModified(networkName)
-	return node, wasFailover, removedClients, err
+	err = SetNetworkNodesLastModified(node.Network)
+	return node, removedClients, err
 }
 
 // DeleteGatewayExtClients - deletes ext clients based on gateway (mac) of ingress node and network
@@ -200,4 +265,19 @@ func DeleteGatewayExtClients(gatewayID string, networkName string) error {
 		}
 	}
 	return nil
+}
+
+// IsUserAllowedAccessToExtClient - checks if user has permission to access extclient
+func IsUserAllowedAccessToExtClient(username string, client models.ExtClient) bool {
+	if username == MasterUser {
+		return true
+	}
+	user, err := GetUser(username)
+	if err != nil {
+		return false
+	}
+	if user.UserName != client.OwnerID {
+		return false
+	}
+	return true
 }

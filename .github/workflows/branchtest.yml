@@ -2,6 +2,11 @@ name: Deploy and Test Branch
 
 on:
   workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to deploy and test'
+        required: true
+        default: 'develop'
   pull_request:
       types: [opened, synchronize, reopened]
       branches: [develop]
@@ -10,49 +15,53 @@ jobs:
   skip-check:
     runs-on: ubuntu-latest
     outputs:
-      skip: ${{ steps.check.outputs.skip }}
+      skip: ${{ steps.skip.outputs.skip }}
     steps:
       - id: skip
         uses: fkirc/skip-duplicate-actions@v5
         with:
           concurrent_skipping: 'always'
+  
   getbranch:
     runs-on: ubuntu-latest
     needs: skip-check
     if: ${{ needs.skip-check.outputs.skip != 'true' }}
     outputs:
-      netclientbranch: ${{ steps.checkbranch.outputs.netclientbranch }}
+      netclientbranch: ${{ steps.getbranch.outputs.netclientbranch }}
+      netmakerbranch: ${{ steps.getbranch.outputs.netmakerbranch }}
     steps:
-      - name: checkout
-        uses: actions/checkout@v3
+      - name: Determine branches
+        id: determine_branches
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "NETMAKER_BRANCH=${{ github.event.inputs.branch }}" >> $GITHUB_ENV
+            echo "NETCLIENT_BRANCH=${{ github.event.inputs.branch }}" >> $GITHUB_ENV
+          else
+            echo "NETMAKER_BRANCH=${{ github.head_ref }}" >> $GITHUB_ENV
+            echo "NETCLIENT_BRANCH=develop" >> $GITHUB_ENV
+          fi
+      - name: Checkout netclient repository
+        uses: actions/checkout@v4
         with:
           repository: gravitl/netclient
-          ref: develop
-      - name: check if branch exists
-        id: checkbranch
+          fetch-depth: 0
+      - name: Check if netclient branch exists and set output
+        id: getbranch 
         run: |
-          if git show-ref ${{ github.head_ref}}; then
-            echo branch exists
-            echo "netclientbranch=${{ github.head_ref }}" >> $GITHUB_OUTPUT
+          if git ls-remote --heads origin ${{ env.NETCLIENT_BRANCH }} | grep -q ${{ env.NETCLIENT_BRANCH }}; then
+            echo "netclient branch ${{ env.NETCLIENT_BRANCH }} exists"
+            echo "netclientbranch=${{ env.NETCLIENT_BRANCH }}" >> $GITHUB_OUTPUT
           else
-            echo branch does not exist
+            echo "netclient branch ${{ env.NETCLIENT_BRANCH }} does not exist, using develop"
             echo "netclientbranch=develop" >> $GITHUB_OUTPUT
           fi
-  
-  terraform:
-    needs: getbranch
-    uses: gravitl/devops/.github/workflows/terraform.yml@master
+          echo "netmakerbranch=${{ env.NETMAKER_BRANCH }}" >> $GITHUB_OUTPUT
+
+  branchtest:
+    uses: gravitl/devops/.github/workflows/testdeploybranch.yml@master
+    needs: [getbranch, skip-check]
     with:
-      netmakerbranch: ${{ github.head_ref }}
       netclientbranch: ${{ needs.getbranch.outputs.netclientbranch }}
-    secrets: inherit
-
-
-  testbranch:
-    needs: [getbranch, terraform]
-    uses: gravitl/devops/.github/workflows/branchtest.yml@master
-    with:
+      netmakerbranch: ${{ needs.getbranch.outputs.netmakerbranch }}
       tag: ${{ github.run_id }}-${{ github.run_attempt }}
-      network: netmaker
     secrets: inherit
-    
